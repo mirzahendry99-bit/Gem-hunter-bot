@@ -1,1 +1,1 @@
-# trading-journal-bot
+# Gem-hunter-bot
