@@ -1,0 +1,53 @@
+name: Gem Hunter Bot
+
+on:
+  # Jalankan otomatis setiap 6 jam
+  schedule:
+    - cron: "0 */6 * * *"   # 00:00 / 06:00 / 12:00 / 18:00 UTC
+                              # = 07:00 / 13:00 / 19:00 / 01:00 WIB
+
+  # Bisa dijalankan manual dari tab Actions
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Alasan run manual (opsional)"
+        required: false
+        default: "manual trigger"
+
+jobs:
+  scan:
+    name: Run Gem Hunter Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 25  # safety: kill jika stuck lebih dari 25 menit
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Gem Hunter
+        env:
+          GATE_API_KEY:    ${{ secrets.GATE_API_KEY }}
+          GATE_API_SECRET: ${{ secrets.GATE_API_SECRET }}
+          TG_BOT_TOKEN:    ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID:      ${{ secrets.TG_CHAT_ID }}
+          SUPABASE_URL:    ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY:    ${{ secrets.SUPABASE_KEY }}
+          SCAN_SLEEP_SEC:  "0.30"
+        run: python gem_hunter_bot.py
+
+      - name: Upload log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gem-hunter-error-log
+          path: "*.log"
+          retention-days: 7
