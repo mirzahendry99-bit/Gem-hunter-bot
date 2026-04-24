@@ -2,19 +2,22 @@ name: Pump Monitor — Scalping (5m)
 
 on:
   schedule:
-    # Setiap 5 menit — GitHub Actions minimum interval
     - cron: "*/5 * * * *"
-  workflow_dispatch:   # Bisa dijalankan manual dari tab Actions
+  workflow_dispatch:
 
 jobs:
   scan:
     name: Scan Pump Signals
     runs-on: ubuntu-latest
-    timeout-minutes: 4   # Safety: paksa stop sebelum run berikutnya
+    timeout-minutes: 4
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Python 3.11
         uses: actions/setup-python@v5
@@ -25,15 +28,20 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run pump monitor
+      - name: Run pump monitor (scalping)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TG_CHAT_ID }}
-          # Signal threshold overrides (opsional):
-          # VOL_SPIKE_MULT:     "5.0"
-          # PRICE_PUMP_PCT:     "3.0"
-          # RSI_OVERSOLD:       "35.0"
-          # RSI_RECOVERY:       "50.0"
-          # MAX_SIGNALS_PER_RUN: "5"
-          # SCAN_SLEEP_SEC:     "0.30"
+          STATE_FILE:          price_state_scalping.json
+          MAX_SNAPSHOTS:       "30"
+          MIN_SNAPS_SIGNAL:    "3"
         run: python indodax_pump_monitor.py
+
+      - name: Commit & push state file
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add price_state_scalping.json
+          git diff --cached --quiet || git commit -m "chore: update price state [scalping] [skip ci]"
+          git push

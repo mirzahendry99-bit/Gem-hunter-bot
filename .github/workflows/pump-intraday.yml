@@ -2,19 +2,22 @@ name: Pump Monitor — Intraday (1h)
 
 on:
   schedule:
-    # Setiap jam — untuk konfirmasi trend dan sinyal lebih tersaring
     - cron: "0 * * * *"
-  workflow_dispatch:   # Bisa dijalankan manual dari tab Actions
+  workflow_dispatch:
 
 jobs:
   scan:
     name: Scan Pump Signals (Intraday)
     runs-on: ubuntu-latest
-    timeout-minutes: 10   # Budget lebih longgar untuk mode intraday
+    timeout-minutes: 10
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Python 3.11
         uses: actions/setup-python@v5
@@ -29,11 +32,21 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TG_CHAT_ID }}
-          # Intraday pakai threshold lebih ketat untuk kualitas sinyal lebih tinggi
-          VOL_SPIKE_MULT:      "7.0"    # volume harus lebih kuat (7×, bukan 5×)
-          PRICE_PUMP_PCT:      "5.0"    # pump minimal 5% (bukan 3%)
-          RSI_OVERSOLD:        "30.0"   # oversold lebih dalam (30, bukan 35)
-          RSI_RECOVERY:        "55.0"   # recovery lebih tinggi (55, bukan 50)
-          MAX_SIGNALS_PER_RUN: "3"      # kirim maks 3 sinyal per jam
-          SCAN_SLEEP_SEC:      "0.40"   # sedikit lebih santai
+          STATE_FILE:          price_state_intraday.json
+          MAX_SNAPSHOTS:       "30"
+          MIN_SNAPS_SIGNAL:    "3"
+          PRICE_PUMP_PCT:      "5.0"
+          VOL_SPIKE_MULT:      "7.0"
+          RSI_OVERSOLD:        "30.0"
+          RSI_RECOVERY:        "55.0"
+          MAX_SIGNALS_PER_RUN: "3"
         run: python indodax_pump_monitor.py
+
+      - name: Commit & push state file
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add price_state_intraday.json
+          git diff --cached --quiet || git commit -m "chore: update price state [intraday] [skip ci]"
+          git push
