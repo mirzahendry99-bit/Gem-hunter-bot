@@ -27,8 +27,8 @@ jobs:
 
       - name: Run pump monitor
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TG_CHAT_ID }}
           # Signal threshold overrides (opsional):
           # VOL_SPIKE_MULT:     "5.0"
           # PRICE_PUMP_PCT:     "3.0"

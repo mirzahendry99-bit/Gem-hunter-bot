@@ -27,8 +27,8 @@ jobs:
 
       - name: Run pump monitor (intraday — threshold lebih ketat)
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TG_CHAT_ID }}
           # Intraday pakai threshold lebih ketat untuk kualitas sinyal lebih tinggi
           VOL_SPIKE_MULT:      "7.0"    # volume harus lebih kuat (7×, bukan 5×)
           PRICE_PUMP_PCT:      "5.0"    # pump minimal 5% (bukan 3%)
