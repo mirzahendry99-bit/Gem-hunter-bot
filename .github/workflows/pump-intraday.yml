@@ -1,0 +1,39 @@
+name: Pump Monitor — Intraday (1h)
+
+on:
+  schedule:
+    # Setiap jam — untuk konfirmasi trend dan sinyal lebih tersaring
+    - cron: "0 * * * *"
+  workflow_dispatch:   # Bisa dijalankan manual dari tab Actions
+
+jobs:
+  scan:
+    name: Scan Pump Signals (Intraday)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10   # Budget lebih longgar untuk mode intraday
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run pump monitor (intraday — threshold lebih ketat)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Intraday pakai threshold lebih ketat untuk kualitas sinyal lebih tinggi
+          VOL_SPIKE_MULT:      "7.0"    # volume harus lebih kuat (7×, bukan 5×)
+          PRICE_PUMP_PCT:      "5.0"    # pump minimal 5% (bukan 3%)
+          RSI_OVERSOLD:        "30.0"   # oversold lebih dalam (30, bukan 35)
+          RSI_RECOVERY:        "55.0"   # recovery lebih tinggi (55, bukan 50)
+          MAX_SIGNALS_PER_RUN: "3"      # kirim maks 3 sinyal per jam
+          SCAN_SLEEP_SEC:      "0.40"   # sedikit lebih santai
+        run: python indodax_pump_monitor.py

@@ -1,0 +1,39 @@
+name: Pump Monitor — Scalping (5m)
+
+on:
+  schedule:
+    # Setiap 5 menit — GitHub Actions minimum interval
+    - cron: "*/5 * * * *"
+  workflow_dispatch:   # Bisa dijalankan manual dari tab Actions
+
+jobs:
+  scan:
+    name: Scan Pump Signals
+    runs-on: ubuntu-latest
+    timeout-minutes: 4   # Safety: paksa stop sebelum run berikutnya
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run pump monitor
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Signal threshold overrides (opsional):
+          # VOL_SPIKE_MULT:     "5.0"
+          # PRICE_PUMP_PCT:     "3.0"
+          # RSI_OVERSOLD:       "35.0"
+          # RSI_RECOVERY:       "50.0"
+          # MAX_SIGNALS_PER_RUN: "5"
+          # SCAN_SLEEP_SEC:     "0.30"
+        run: python indodax_pump_monitor.py
