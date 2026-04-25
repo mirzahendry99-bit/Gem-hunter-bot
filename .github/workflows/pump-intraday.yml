@@ -6,28 +6,41 @@ on:
   workflow_dispatch:
 
 jobs:
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest
+      - name: Run tests
+        env:
+          TELEGRAM_BOT_TOKEN: dummy_token_for_test
+          TELEGRAM_CHAT_ID:   dummy_chat_for_test
+        run: pytest indodax_pump_monitor.py --tb=short -q
+
   scan:
     name: Scan Pump Signals (Intraday)
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    needs: test          # scan hanya jalan jika tests pass
     permissions:
       contents: write
-
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Setup Python 3.11
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
-
       - name: Install dependencies
         run: pip install -r requirements.txt
-
       - name: Run pump monitor (intraday — threshold lebih ketat)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
@@ -41,7 +54,6 @@ jobs:
           RSI_RECOVERY:        "55.0"
           MAX_SIGNALS_PER_RUN: "3"
         run: python indodax_pump_monitor.py
-
       - name: Commit & push state file
         if: always()
         run: |
