@@ -45,6 +45,8 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TG_CHAT_ID }}
+          SUPABASE_URL:       ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY:       ${{ secrets.SUPABASE_KEY }}
           STATE_FILE:          price_state_intraday.json
           MAX_SNAPSHOTS:       "30"
           MIN_SNAPS_SIGNAL:    "3"
