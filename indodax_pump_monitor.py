@@ -1742,7 +1742,10 @@ if __name__ == "__main__":
 #  UNIT TESTS — jalankan dengan: pytest indodax_pump_monitor.py -v
 # ══════════════════════════════════════════════════════════════════
 
-import pytest  # noqa: E402
+try:
+    import pytest  # noqa: E402
+except ImportError:
+    pytest = None  # type: ignore  # bot tetap jalan tanpa pytest
 # ══════════════════════════════════════════════════════════════════
 #  FIXTURES
 # ══════════════════════════════════════════════════════════════════
