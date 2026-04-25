@@ -359,30 +359,66 @@ def fetch_all_tickers() -> dict[str, dict]:
 #  RISK LEVELS
 # ══════════════════════════════════════════════════════════════════
 
-def calc_levels(current_price: float) -> dict:
+def calc_levels(current_price: float, high_24h: float = 0.0) -> dict:
     """
     Hitung level trading dari harga sekarang.
 
-    Entry zone = current_price × (1 - ENTRY_DISCOUNT_PCT/100)
-    → sedikit di bawah harga pump untuk hindari chasing.
-    SL/TP dihitung dari entry zone (bukan current_price).
+    Entry = current_price × (1 - ENTRY_DISCOUNT_PCT/100)
+    SL    = entry × (1 - SL_PCT/100)
+    R     = entry - SL  (satuan risiko)
+
+    TP dihitung berdasarkan R-multiple (bukan fixed %):
+      TP1 = entry + 1× R  → titik impas jika sebagian posisi di-close
+      TP2 = entry + 2× R  → profit bersih 1× risiko
+      TP3 = entry + 3× R  → extended target
+
+    Jika high_24h berada antara TP1 dan TP2, ia menjadi
+    resistance_note — zona waspada sebelum TP2 tercapai.
     """
     if current_price <= 0:
         return {}
+
     entry = current_price * (1 - ENTRY_DISCOUNT_PCT / 100)
-    sl    = entry * (1 - SL_PCT  / 100)
-    tp1   = entry * (1 + TP1_PCT / 100)
-    tp2   = entry * (1 + TP2_PCT / 100)
-    tp3   = entry * (1 + TP3_PCT / 100)
-    rr    = round((tp2 - entry) / (entry - sl), 1) if entry > sl else 0.0
+    sl    = entry * (1 - SL_PCT / 100)
+    R     = entry - sl
+    if R <= 0:
+        return {}
+
+    tp1 = entry + 1.0 * R
+    tp2 = entry + 2.0 * R
+    tp3 = entry + 3.0 * R
+
+    # R/R vs TP2 selalu 2.0× by definition
+    rr = 2.0
+
+    # Pct aktual dari entry (untuk display)
+    tp1_pct = round((tp1 - entry) / entry * 100, 1)
+    tp2_pct = round((tp2 - entry) / entry * 100, 1)
+    tp3_pct = round((tp3 - entry) / entry * 100, 1)
+    sl_pct  = round((entry - sl) / entry * 100, 1)
+
+    # Cek apakah high_24h jadi natural resistance sebelum TP2
+    resistance_note = ""
+    if high_24h > entry:
+        if tp1 < high_24h < tp2:
+            resistance_note = f"⚠️ Resistance di {_fp(high_24h)} (high 24h) — waspada sebelum TP2"
+        elif high_24h <= tp1:
+            resistance_note = f"⚠️ High 24h {_fp(high_24h)} di bawah TP1 — zona resistance ketat"
+
     return {
-        "current": current_price,
-        "entry":   round(entry, 8),
-        "sl":      round(sl,    8),
-        "tp1":     round(tp1,   8),
-        "tp2":     round(tp2,   8),
-        "tp3":     round(tp3,   8),
-        "rr":      rr,
+        "current":        current_price,
+        "entry":          round(entry, 8),
+        "sl":             round(sl,    8),
+        "sl_pct":         sl_pct,
+        "tp1":            round(tp1,   8),
+        "tp2":            round(tp2,   8),
+        "tp3":            round(tp3,   8),
+        "tp1_pct":        tp1_pct,
+        "tp2_pct":        tp2_pct,
+        "tp3_pct":        tp3_pct,
+        "rr":             rr,
+        "R":              round(R, 8),
+        "resistance_note": resistance_note,
     }
 
 
@@ -456,8 +492,77 @@ def analyze_pair(
 
 
 # ══════════════════════════════════════════════════════════════════
-#  DATABASE — OUTCOME TRACKING & ADAPTIVE LEARNING
+#  TIER SCORING
 # ══════════════════════════════════════════════════════════════════
+#
+#  Adaptasi dari Gate.io bot TIER_MIN_SCORE (S:12 A+:9 A:6)
+#  ke sinyal yang tersedia di Indodax pump monitor.
+#
+#  Komponen skor (max 15):
+#  ┌─────────────────────────────────┬──────┐
+#  │ Pump strength                   │  0-5 │
+#  │   >= 10%  → 5 | >= 7% → 4      │      │
+#  │   >= 5%   → 3 | >= 3% → 2      │      │
+#  ├─────────────────────────────────┼──────┤
+#  │ Volume spike                    │  0-5 │
+#  │   >= 15×  → 5 | >= 10× → 4     │      │
+#  │   >= 7×   → 3 | >= 5×  → 2     │      │
+#  ├─────────────────────────────────┼──────┤
+#  │ RSI cross confirmed             │  0-3 │
+#  │   RSI >= 55 → 3 | >= 50 → 2    │      │
+#  ├─────────────────────────────────┼──────┤
+#  │ History reliability             │  0-2 │
+#  │   snaps >= 16 → 2 | >= 8 → 1   │      │
+#  └─────────────────────────────────┴──────┘
+#
+#  Tier: S >= 12 | A+ >= 9 | A >= 6 | SKIP < 6
+
+_TIER_LABELS = {
+    "S":  ("💎", "TIER S",  12),
+    "A+": ("🏆", "TIER A+",  9),
+    "A":  ("🥇", "TIER A",   6),
+}
+
+
+def calc_score(sig: dict) -> tuple[int, str]:
+    """
+    Hitung score sinyal dan assign tier (S / A+ / A).
+    Return (score, tier_str).
+    """
+    score = 0
+
+    # Komponen 1: Pump strength (0-5)
+    p = sig.get("pump_pct", 0)
+    if   p >= 10: score += 5
+    elif p >= 7:  score += 4
+    elif p >= 5:  score += 3
+    elif p >= 3:  score += 2
+
+    # Komponen 2: Volume spike (0-5)
+    v = sig.get("vol_ratio", 0)
+    if   v >= 15: score += 5
+    elif v >= 10: score += 4
+    elif v >= 7:  score += 3
+    elif v >= 5:  score += 2
+
+    # Komponen 3: RSI cross (0-3)
+    if sig.get("has_rsi") and sig.get("rsi", 0) > 0:
+        r = sig["rsi"]
+        if   r >= 55: score += 3
+        elif r >= 50: score += 2
+
+    # Komponen 4: History reliability (0-2)
+    s = sig.get("snaps", 0)
+    if   s >= 16: score += 2
+    elif s >= 8:  score += 1
+
+    # Assign tier
+    if   score >= 12: tier = "S"
+    elif score >= 9:  tier = "A+"
+    elif score >= 6:  tier = "A"
+    else:             tier = "A"   # sudah lolos 4 gate, minimal A
+
+    return score, tier
 
 def _get_sb():
     """Return Supabase client, atau None jika tidak tersedia/konfigurasi."""
@@ -730,95 +835,87 @@ def _fmt_idr(v: float) -> str:
 
 
 def format_signal(sig: dict, wr_data: dict | None = None) -> str:
-    """
-    Format sinyal pump ke Telegram — layout mengikuti style Gate.io Signal Bot:
-    header → pair + valid until → entry note → level table → metadata → footer.
-    """
     ts           = sig["ts"]
     pair_display = sig["pair"].replace("_", "/").upper()
     lvl          = calc_levels(sig["price"])
     if not lvl:
         return f"🚨 <b>PUMP — {sig['coin']}</b>\n{pair_display}\n⚠️ Level tidak bisa dihitung."
 
-    now         = ts
-    valid_until = (now + timedelta(hours=SIGNAL_EXPIRE_HOURS)).strftime("%H:%M WIB")
-    now_str     = now.strftime("%H:%M")
+    # ── Tier & Score
+    score, tier            = calc_score(sig)
+    tier_emoji, tier_label, _ = _TIER_LABELS.get(tier, ("🥇", "TIER A", 6))
+    score_bar = "█" * min(score, 15) + "░" * max(0, 15 - score)
 
-    # ── Strength label berdasarkan pump% + vol ratio
-    pump  = sig["pump_pct"]
-    vol_r = sig.get("vol_ratio", 0)
-    if pump >= 8 and vol_r >= 8:
-        strength     = "💎 STRONG"
-        strength_bar = "█████"
-    elif pump >= 5 and vol_r >= 5:
-        strength     = "🏆 SOLID"
-        strength_bar = "████░"
-    else:
-        strength     = "🥇 VALID"
-        strength_bar = "███░░"
+    lvl = calc_levels(sig["price"], sig.get("high_24h", 0))
 
-    # ── Entry note: apakah harga sudah jauh dari entry?
-    # Pump baru saja terjadi — entry masih relevan jika dalam ±1%
+    # ── Valid window
+    valid_until = (ts + timedelta(hours=SIGNAL_EXPIRE_HOURS)).strftime("%H:%M WIB")
+
+    # ── Entry note (pump sudah besar → warning chasing)
     entry_note = ""
-    if pump > 5.0:
+    if sig["pump_pct"] > 5.0:
         entry_note = (
-            f"\n⚠️ <i>Pump sudah {pump:.1f}% — masuk hanya jika ada retest/koreksi "
-            f"ke zona entry. Jangan kejar harga!</i>"
+            f"\n⚠️ <i>Pump sudah {sig['pump_pct']:.1f}% — "
+            f"tunggu retest ke entry zone!</i>"
         )
 
-    # ── RSI line
+    # ── RSI
     rsi_line = (
-        f"RSI(14)    : <b>{sig['rsi']:.1f}</b>\n"
+        f"RSI(14)    : <b>{sig['rsi']:.1f}</b>  <i>(recovery ✅)</i>\n"
         if sig.get("has_rsi") and sig["rsi"] > 0
         else f"RSI(14)    : <i>akumulasi ({sig['snaps']}/{MIN_SNAPS_RSI} snap)</i>\n"
     )
 
-    # ── Hist WR dari Supabase (jika tersedia)
+    # ── Hist WR
     if wr_data and wr_data.get("n_total", 0) >= WR_MIN_SAMPLE:
         hist_wr = (
             f"Hist WR    : <b>{wr_data['wr']:.0%}★</b> "
-            f"({wr_data['n_win']}/{wr_data['n_total']}) "
+            f"({wr_data['n_win']}/{wr_data['n_total']})  "
             f"E[PnL]: <b>{wr_data['expectancy']:+.1f}%</b>\n"
         )
     else:
         n = wr_data.get("n_total", 0) if wr_data else 0
         hist_wr = f"Hist WR    : <i>akumulasi data ({n}/{WR_MIN_SAMPLE})</i>\n"
 
-    # ── Adaptive threshold label
-    thresh_label = f"Threshold  : pump≥{PRICE_PUMP_PCT:.1f}% | vol≥{VOL_SPIKE_MULT:.1f}×\n"
-
-    # ── Support line
+    # ── Support
     low_ref  = sig.get("low_24h", 0)
-    low_line = f"└ Support : <code>{_fp(low_ref)}</code>  <i>(low 24h)</i>\n" if low_ref > 0 else ""
+    low_line = (
+        f"🛡 Support  : <code>{_fp(low_ref)}</code>  <i>(low 24h)</i>\n"
+        if low_ref > 0 else ""
+    )
 
-    msg = (
-        f"🚨 <b>{strength} — PUMP {sig['coin']}</b>\n"
+    return (
+        f"🚨 {tier_emoji} <b>{tier_label} — PUMP {sig['coin']}</b>\n"
+        f"<code>Score {score:02d}/15  [{score_bar}]</code>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"Pair       : <b>{pair_display}</b>\n"
-        f"⏰ Valid    : {now_str} → {valid_until}\n"
-        f"Strength   : {strength_bar}\n"
+        f"⏰ Valid    : {ts.strftime('%H:%M')} → {valid_until}\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"Harga skrg : <b>{_fp(lvl['current'])}</b> IDR\n"
         f"Entry Zone : <b>{_fp(lvl['entry'])}</b> IDR  "
         f"<i>(-{ENTRY_DISCOUNT_PCT:.1f}% retest)</i>{entry_note}\n"
-        f"TP1        : <b>{_fp(lvl['tp1'])}</b>  <i>(+{TP1_PCT:.0f}%)</i>\n"
-        f"TP2        : <b>{_fp(lvl['tp2'])}</b>  <i>(+{TP2_PCT:.0f}%)</i>\n"
-        f"TP3        : <b>{_fp(lvl['tp3'])}</b>  <i>(+{TP3_PCT:.0f}%)</i>\n"
+        f"\n"
+        f"🎯 TP1  : <b>{_fp(lvl['tp1'])}</b>  "
+        f"<i>+{lvl['tp1_pct']:.1f}% (1R)</i>\n"
+        f"🏆 TP2  : <b>{_fp(lvl['tp2'])}</b>  "
+        f"<i>+{lvl['tp2_pct']:.1f}% (2R) — target utama</i>\n"
+        f"🚀 TP3  : <b>{_fp(lvl['tp3'])}</b>  "
+        f"<i>+{lvl['tp3_pct']:.1f}% (3R) — hold sebagian</i>\n"
         f"{low_line}"
-        f"SL         : <b>{_fp(lvl['sl'])}</b>  <i>(-{SL_PCT:.0f}%)</i>\n"
-        f"R/R        : <b>1:{lvl['rr']}</b> (vs TP2)\n"
+        f"🔴 SL   : <b>{_fp(lvl['sl'])}</b>  "
+        f"<i>-{lvl['sl_pct']:.1f}% — cut wajib</i>\n"
+        f"R/R        : <b>1:{lvl['rr']}</b>  <i>(vs TP2)  |  R = {_fp(lvl['R'])} IDR</i>\n"
+        f"{(lvl['resistance_note'] + chr(10)) if lvl.get('resistance_note') else ''}"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"Pump       : <b>+{sig['pump_pct']:.2f}%</b> vs snapshot lalu\n"
         f"Vol Spike  : <b>{sig['vol_ratio']:.1f}×</b> baseline\n"
         f"{rsi_line}"
         f"Vol 24h    : {_fmt_idr(sig['vol_idr'])}\n"
-        f"Snaps      : {sig['snaps']} snapshot window\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"{hist_wr}"
-        f"{thresh_label}"
+        f"Threshold  : pump≥{PRICE_PUMP_PCT:.1f}% | vol≥{VOL_SPIKE_MULT:.1f}×\n"
         f"<i>⚠️ Pasang SL wajib. Bukan saran investasi.</i>"
     )
-    return msg
 
 
 def format_summary(scanned: int, n_snaps: int, candidates: int, sent: int) -> str:
@@ -913,7 +1010,7 @@ def run_scan() -> None:
     candidates.sort(key=lambda x: (-x["pump_pct"], -x["vol_ratio"]))
     sent = 0
     for sig in candidates[:MAX_SIGNALS_PER_RUN]:
-        lvl = calc_levels(sig["price"])
+        lvl = calc_levels(sig["price"], sig.get("high_24h", 0))
         if tg(format_signal(sig, wr_data)):
             sent += 1
             db_save_signal(sig, lvl)
