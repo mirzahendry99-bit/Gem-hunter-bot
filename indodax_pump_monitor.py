@@ -858,7 +858,7 @@ def db_evaluate_outcomes(tickers: dict) -> dict:
     try:
         rows = (
             sb.table(DB_TABLE)
-            .select("id, pair, entry, sl, tp1, tp2, tp3, sent_at, tp1_hit, tp2_hit")
+            .select("id, pair, tier, mode, entry, sl, tp1, tp2, tp3, sent_at, tp1_hit, tp2_hit")
             .is_("result", "null")
             .order("sent_at", desc=False)
             .limit(50)
@@ -889,6 +889,7 @@ def db_evaluate_outcomes(tickers: dict) -> dict:
             tp3      = float(row["tp3"])
             tp1_hit  = bool(row.get("tp1_hit") or False)
             tp2_hit  = bool(row.get("tp2_hit") or False)
+            mode     = (row.get("mode") or "SCALPING").upper()
 
             sent_at = datetime.fromisoformat(row["sent_at"].replace("Z", "+00:00"))
             age_h   = (now_utc - sent_at).total_seconds() / 3600
@@ -909,37 +910,43 @@ def db_evaluate_outcomes(tickers: dict) -> dict:
 
             pnl_pct = round((price - entry) / entry * 100, 2)
 
-            # ── SL: tutup trade sepenuhnya
+            # ── SL: tutup trade + kirim notifikasi
             if price <= sl:
+                sl_pnl = round((sl - entry) / entry * 100, 2)
                 sb.table(DB_TABLE).update({
                     "result": "SL",
-                    "pnl_pct": round((sl - entry) / entry * 100, 2),
+                    "pnl_pct": sl_pnl,
                     "closed_at": now_utc.isoformat(),
                 }).eq("id", rec_id).execute()
                 stats["sl"] += 1
                 log(f"  {pair} → SL ({pnl_pct:+.1f}%)")
+                tg(_fmt_stop_loss(pair, entry, sl, price, mode))
 
-            # ── TP3: tutup trade sepenuhnya
+            # ── TP3: tutup trade + kirim notifikasi
             elif price >= tp3:
+                tp3_pct = round((tp3 - entry) / entry * 100, 1)
                 sb.table(DB_TABLE).update({
                     "result": "TP3",
-                    "pnl_pct": round((tp3 - entry) / entry * 100, 2),
+                    "pnl_pct": tp3_pct,
                     "tp1_hit": True, "tp2_hit": True,
                     "closed_at": now_utc.isoformat(),
                 }).eq("id", rec_id).execute()
                 stats["tp3"] += 1
                 log(f"  {pair} → TP3 ({pnl_pct:+.1f}%)")
+                tg(_fmt_tp_closed(pair, entry, tp3, "TP3", tp3_pct, mode))
 
-            # ── TP2: tutup trade sepenuhnya
+            # ── TP2: tutup trade + kirim notifikasi
             elif price >= tp2:
+                tp2_pct = round((tp2 - entry) / entry * 100, 1)
                 sb.table(DB_TABLE).update({
                     "result": "TP2",
-                    "pnl_pct": round((tp2 - entry) / entry * 100, 2),
+                    "pnl_pct": tp2_pct,
                     "tp1_hit": True, "tp2_hit": True,
                     "closed_at": now_utc.isoformat(),
                 }).eq("id", rec_id).execute()
                 stats["tp2"] += 1
                 log(f"  {pair} → TP2 ({pnl_pct:+.1f}%)")
+                tg(_fmt_tp_closed(pair, entry, tp2, "TP2", tp2_pct, mode))
 
             # ── TP1 hit pertama kali: kirim notifikasi + tandai di DB
             elif price >= tp1 and not tp1_hit:
@@ -949,7 +956,6 @@ def db_evaluate_outcomes(tickers: dict) -> dict:
                 }).eq("id", rec_id).execute()
                 stats["tp1"] += 1
                 log(f"  {pair} → TP1 hit ✅ — nunggu TP2 ({pnl_pct:+.1f}%)")
-                # Kirim notifikasi Partial Profit Taken ke Telegram
                 tg(_fmt_partial_profit(pair, entry, tp1, tp1_pct, tp2, sl))
 
             else:
@@ -960,6 +966,48 @@ def db_evaluate_outcomes(tickers: dict) -> dict:
             log(f"  outcome [{row.get('pair')}]: {e}", "warn")
 
     return stats
+
+
+def _fmt_stop_loss(pair: str, entry: float, sl: float, price: float, mode: str) -> str:
+    """Notifikasi Stop Loss kena — mirip Gate.io bot format."""
+    pair_display = pair.replace("_", "/").upper()
+    pnl_pct      = round((sl - entry) / entry * 100, 1)
+    pnl_idr      = BASE_POSITION_IDR * abs(pnl_pct) / 100
+    return (
+        f"❌ <b>Stop Loss — {pair_display}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"Strategy   : {mode} BUY\n"
+        f"Entry      : <code>{_fp(entry)}</code> IDR\n"
+        f"SL kena    : <code>{_fp(sl)}</code> IDR\n"
+        f"Now        : <code>{_fp(price)}</code> IDR\n"
+        f"PnL        : <b>{pnl_pct:.1f}%</b>  "
+        f"≈ <b>-{_fmt_idr(pnl_idr)}</b>\n"
+        f"<i>SL tersentuh — loss terkontrol 🛡</i>"
+    )
+
+
+def _fmt_tp_closed(
+    pair:    str,
+    entry:   float,
+    tp_lvl:  float,
+    tp_name: str,
+    tp_pct:  float,
+    mode:    str,
+) -> str:
+    """Notifikasi TP2 / TP3 tercapai — trade ditutup penuh."""
+    pair_display = pair.replace("_", "/").upper()
+    pnl_idr      = BASE_POSITION_IDR * tp_pct / 100
+    emoji        = "🏆" if tp_name == "TP2" else "🚀"
+    return (
+        f"{emoji} <b>{tp_name} Tercapai — {pair_display}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"Strategy   : {mode} BUY\n"
+        f"Entry      : <code>{_fp(entry)}</code> IDR\n"
+        f"{tp_name} kena  : <code>{_fp(tp_lvl)}</code> IDR\n"
+        f"PnL        : <b>+{tp_pct:.1f}%</b>  "
+        f"≈ <b>+{_fmt_idr(pnl_idr)}</b>\n"
+        f"✅ <i>Posisi penuh ditutup — profit terealisasi</i>"
+    )
 
 
 def _fmt_partial_profit(
@@ -1071,10 +1119,14 @@ def db_open_trades_report(tickers: dict) -> Optional[str]:
                 f"\n{i}. 🟢 BUY {pair_display} [{mode}]{tp_status}\n"
                 f"   {tier_emoji} Tier {tier}  |  Usia: {age_h}j\n"
                 f"   Entry : <code>{_fp(entry)}</code>\n"
-                f"   TP1   : <code>{_fp(tp1)}</code>  {'✅' if tp1_hit else ''}\n"
-                f"   TP2   : <code>{_fp(tp2)}</code>  {'✅' if tp2_hit else ''}\n"
-                f"   TP3   : <code>{_fp(tp3)}</code>\n"
-                f"   SL    : <code>{_fp(sl)}</code>\n"
+                f"   TP1   : <code>{_fp(tp1)}</code>  "
+                f"<i>(+{round((tp1-entry)/entry*100,1):.1f}%)</i>  {'✅' if tp1_hit else ''}\n"
+                f"   TP2   : <code>{_fp(tp2)}</code>  "
+                f"<i>(+{round((tp2-entry)/entry*100,1):.1f}%)</i>  {'✅' if tp2_hit else ''}\n"
+                f"   TP3   : <code>{_fp(tp3)}</code>  "
+                f"<i>(+{round((tp3-entry)/entry*100,1):.1f}%)</i>\n"
+                f"   SL    : <code>{_fp(sl)}</code>  "
+                f"<i>(-{round((entry-sl)/entry*100,1):.1f}%)</i>\n"
                 f"   Now   : <b>{_fp(now_price)}</b>  {pnl_icon} <b>{pnl_str}</b>"
             )
             lines.append(line)
