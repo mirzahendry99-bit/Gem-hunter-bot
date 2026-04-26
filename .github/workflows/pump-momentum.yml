@@ -1,0 +1,85 @@
+name: Pump Monitor — Momentum (5m)
+# Mode: WATCH hunter agresif — prioritas sinyal SEBELUM pump
+# Target: deteksi akumulasi volume + early entry
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run tests
+        env:
+          TELEGRAM_BOT_TOKEN: dummy_token_for_test
+          TELEGRAM_CHAT_ID:   dummy_chat_for_test
+        run: pytest indodax_pump_monitor.py --tb=short -q
+
+  scan:
+    name: Scan Momentum Signals
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    needs: test
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run pump monitor (momentum — WATCH hunter)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TG_CHAT_ID }}
+          SUPABASE_URL:       ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY:       ${{ secrets.SUPABASE_KEY }}
+          STATE_FILE:         price_state_momentum.json
+
+          # ── Threshold sinyal pump (setelah pump terjadi)
+          PRICE_PUMP_PCT:     "3.0"   # pump minimal 3%
+          VOL_SPIKE_MULT:     "5.0"   # vol spike 5×
+
+          # ── WATCH: agresif — catch akumulasi lebih awal
+          WATCH_PRICE_FLAT_PCT:  "3.0"   # flat ≤3% (lebih longgar)
+          WATCH_VOL_BUILD_MIN:   "1.5"   # mulai detect dari 1.5× (lebih sensitif)
+          WATCH_VOL_BUILD_MAX:   "4.9"   # batas atas tetap
+          WATCH_MIN_SNAPS:       "3"     # butuh minimal 3 snapshot (lebih cepat)
+          MAX_WATCH_PER_RUN:     "5"     # kirim max 5 WATCH per run
+
+          # ── Early Signal: lebih sensitif
+          EARLY_BREAKOUT_PCT:    "1.0"   # breakout 1% dari baseline (bukan 1.5%)
+          WATCH_EXPIRE_MINUTES:  "20"    # WATCH expire lebih cepat (20 mnt)
+          EARLY_SL_PCT:          "2.5"   # SL lebih ketat (2.5%)
+
+          # ── Portfolio
+          MAX_SIGNALS_PER_RUN:   "3"
+          MAX_OPEN_TRADES:       "10"
+
+          # ── BTC trend — lebih toleran (momentum bisa jalan di sideways)
+          BTC_DROP_THRESHOLD:    "-3.0"  # blokir hanya jika BTC turun 3%+
+        run: python indodax_pump_monitor.py
+
+      - name: Commit & push state file
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add price_state_momentum.json
+          git diff --cached --quiet || git commit -m "chore: update state [momentum] [skip ci]"
+          git push
