@@ -112,7 +112,25 @@ VOL_MULT_MIN,  VOL_MULT_MAX  = 3.0, 12.0
 # Bayesian prior (Jeffreys)
 _BAYES_A, _BAYES_B = 0.5, 0.5
 
-# Runtime
+# ── Market Condition Filter (BTC trend guard)
+BTC_TREND_ENABLED  = os.environ.get("BTC_TREND_ENABLED", "true").lower() == "true"
+BTC_TREND_WINDOW   = int(os.environ.get("BTC_TREND_WINDOW",  "3"))    # snapshot terakhir untuk trend
+BTC_DROP_THRESHOLD = float(os.environ.get("BTC_DROP_THRESHOLD", "-2.0"))  # % drop → skip semua sinyal
+BINANCE_BTC_URL    = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
+
+# ── Volume Confirmation (vol_delta naik N snapshot berturut)
+VOL_CONFIRM_SNAPS  = int(os.environ.get("VOL_CONFIRM_SNAPS", "3"))  # min snapshot delta naik
+
+# ── Auto-blacklist pair manipulatif
+BLACKLIST_SL_COUNT    = int(os.environ.get("BLACKLIST_SL_COUNT",   "3"))   # SL berapa kali → blacklist
+BLACKLIST_WINDOW_DAYS = int(os.environ.get("BLACKLIST_WINDOW_DAYS", "7"))   # dalam berapa hari
+BLACKLIST_COOLDOWN_H  = int(os.environ.get("BLACKLIST_COOLDOWN_H",  "48"))  # jam cooldown setelah blacklist
+# Harga naik ≥ nilai ini dari baseline WATCH → kirim early signal (sebelum pump penuh)
+EARLY_BREAKOUT_PCT   = float(os.environ.get("EARLY_BREAKOUT_PCT",  "1.5"))
+# Berapa lama WATCH disimpan di state sebelum expire (dalam menit)
+WATCH_EXPIRE_MINUTES = int(os.environ.get("WATCH_EXPIRE_MINUTES",  "30"))
+# SL lebih ketat untuk early entry (masuk lebih awal, risiko lebih kecil)
+EARLY_SL_PCT         = float(os.environ.get("EARLY_SL_PCT",         "3.0"))
 REQUEST_TIMEOUT_SEC = int(os.environ.get("REQUEST_TIMEOUT",     "10"))
 TG_SEND_SLEEP_SEC   = float(os.environ.get("TG_SEND_SLEEP_SEC", "1.0"))
 MAX_SIGNALS_PER_RUN = int(os.environ.get("MAX_SIGNALS_PER_RUN", "5"))
@@ -264,6 +282,230 @@ def get_pair_history(state: dict, pair: str) -> list[dict]:
         if entry:
             result.append({"ts": snap["ts"], **entry})
     return result
+
+
+def state_save_thresholds(state: dict, pump_pct: float, vol_mult: float) -> dict:
+    """
+    Simpan threshold adaptif ke state agar persisten antar run.
+    Threshold tidak reset ke default setiap run.
+    """
+    state["adaptive"] = {
+        "pump_pct":  round(pump_pct, 3),
+        "vol_mult":  round(vol_mult, 3),
+        "updated_ts": int(time.time()),
+    }
+    return state
+
+
+def state_load_thresholds(state: dict) -> tuple[float, float]:
+    """
+    Load threshold adaptif dari state.
+    Fallback ke env var default jika belum ada.
+    """
+    adaptive = state.get("adaptive", {})
+    pump = float(adaptive.get("pump_pct", PRICE_PUMP_PCT))
+    vol  = float(adaptive.get("vol_mult", VOL_SPIKE_MULT))
+    pump = max(PUMP_PCT_MIN, min(PUMP_PCT_MAX, pump))
+    vol  = max(VOL_MULT_MIN,  min(VOL_MULT_MAX,  vol))
+    return pump, vol
+
+
+def state_save_watches(state: dict, watches: list[dict]) -> dict:
+    """
+    Simpan WATCH signals ke state agar bisa dicek di run berikutnya.
+    Format per entry: {pair, baseline_price, baseline_vol, ts, vol_ratio}
+    Hanya simpan yang belum expire.
+    """
+    now_ts    = int(time.time())
+    expire_ts = now_ts - WATCH_EXPIRE_MINUTES * 60
+
+    # Merge dengan watch lama yang belum expire
+    existing  = {w["pair"]: w for w in state.get("watches", [])
+                 if w.get("ts", 0) >= expire_ts}
+
+    # Update/tambah watch baru
+    for w in watches:
+        existing[w["pair"]] = {
+            "pair":           w["pair"],
+            "baseline_price": w["price"],
+            "baseline_vol":   w["vol_idr"],
+            "vol_ratio":      w["vol_ratio"],
+            "ts":             now_ts,
+        }
+
+    state["watches"] = list(existing.values())
+    return state
+
+
+def state_get_active_watches(state: dict) -> list[dict]:
+    """Return list WATCH yang masih aktif (belum expire)."""
+    now_ts    = int(time.time())
+    expire_ts = now_ts - WATCH_EXPIRE_MINUTES * 60
+    return [w for w in state.get("watches", []) if w.get("ts", 0) >= expire_ts]
+
+
+def state_remove_watch(state: dict, pair: str) -> dict:
+    """Hapus pair dari watch list (sudah jadi early signal atau expired)."""
+    state["watches"] = [w for w in state.get("watches", []) if w["pair"] != pair]
+    return state
+
+
+# ══════════════════════════════════════════════════════════════════
+#  FEATURE 1: MARKET CONDITION FILTER
+# ══════════════════════════════════════════════════════════════════
+
+def get_btc_trend(state: dict) -> tuple[float, str]:
+    """
+    Cek trend BTC dari snapshot BTC yang tersimpan di state.
+    Jika belum ada, fetch dari Binance untuk seed awal.
+
+    Return (pct_change, label) dimana label:
+      "bearish"  — BTC turun ≥ BTC_DROP_THRESHOLD → block semua sinyal
+      "neutral"  — BTC flat atau naik tipis → lanjut
+      "bullish"  — BTC naik signifikan → boost confidence
+    """
+    # Ambil BTC history dari state
+    btc_history = state.get("btc_prices", [])
+
+    # Fetch harga BTC sekarang dari Binance
+    try:
+        resp  = requests.get(BINANCE_BTC_URL, timeout=REQUEST_TIMEOUT_SEC)
+        price = float(resp.json().get("price", 0))
+        if price > 0:
+            state.setdefault("btc_prices", []).append({
+                "ts": int(time.time()), "price": price
+            })
+            # Trim ke BTC_TREND_WINDOW × 2
+            state["btc_prices"] = state["btc_prices"][-(BTC_TREND_WINDOW * 2):]
+    except Exception as e:
+        log(f"BTC fetch dari Binance gagal: {e}", "warn")
+        price = 0.0
+
+    btc_history = state.get("btc_prices", [])
+    if len(btc_history) < 2 or price <= 0:
+        return 0.0, "neutral"   # tidak cukup data → jangan blokir
+
+    # Bandingkan harga BTC sekarang vs N snapshot lalu
+    window  = btc_history[-min(BTC_TREND_WINDOW + 1, len(btc_history)):]
+    old_btc = float(window[0]["price"])
+    if old_btc <= 0:
+        return 0.0, "neutral"
+
+    pct = round((price - old_btc) / old_btc * 100, 2)
+
+    if pct <= BTC_DROP_THRESHOLD:
+        label = "bearish"
+    elif pct >= 1.5:
+        label = "bullish"
+    else:
+        label = "neutral"
+
+    log(f"📊 BTC trend: {pct:+.2f}% ({label}) | now={price:,.0f} | "
+        f"prev={old_btc:,.0f} ({len(window)-1} snap lalu)")
+    return pct, label
+
+
+# ══════════════════════════════════════════════════════════════════
+#  FEATURE 2: VOLUME CONFIRMATION (3 snapshot berturut)
+# ══════════════════════════════════════════════════════════════════
+
+def gate_vol_confirm(history: list[dict], curr_vol: float) -> tuple[bool, int]:
+    """
+    Konfirmasi: volume delta harus naik berturut-turut selama
+    VOL_CONFIRM_SNAPS snapshot terakhir.
+
+    Ini memastikan volume build-up berkelanjutan, bukan spike satu kali
+    yang langsung koreksi.
+
+    Return (passed, consecutive_count)
+    """
+    if len(history) < VOL_CONFIRM_SNAPS:
+        return False, 0
+
+    vols   = [h["vol"] for h in history] + [curr_vol]
+    deltas = [max(0.0, vols[i] - vols[i-1]) for i in range(1, len(vols))]
+
+    if len(deltas) < VOL_CONFIRM_SNAPS:
+        return False, 0
+
+    # Hitung berapa snapshot terakhir yang delta-nya naik berturut-turut
+    count = 0
+    for i in range(len(deltas) - 1, 0, -1):
+        if deltas[i] > deltas[i-1]:
+            count += 1
+        else:
+            break
+
+    return count >= VOL_CONFIRM_SNAPS, count
+
+
+# ══════════════════════════════════════════════════════════════════
+#  FEATURE 3: AUTO-BLACKLIST PAIR MANIPULATIF
+# ══════════════════════════════════════════════════════════════════
+
+def db_update_blacklist(state: dict) -> dict:
+    """
+    Cek Supabase untuk pair yang SL berkali-kali dalam BLACKLIST_WINDOW_DAYS.
+    Simpan blacklist ke state agar cepat dicek tanpa DB call di setiap pair.
+
+    Blacklist entry: {"pair": str, "sl_count": int, "until_ts": int}
+    """
+    sb = _get_sb()
+    if not sb:
+        return state
+
+    try:
+        from_dt = (datetime.now(timezone.utc) -
+                   timedelta(days=BLACKLIST_WINDOW_DAYS)).isoformat()
+        rows = (
+            sb.table(DB_TABLE)
+            .select("pair, result")
+            .eq("result", "SL")
+            .gte("closed_at", from_dt)
+            .execute()
+            .data
+        ) or []
+    except Exception as e:
+        log(f"db_update_blacklist: {e}", "warn")
+        return state
+
+    # Hitung SL per pair
+    sl_counts: dict[str, int] = {}
+    for r in rows:
+        pair = r.get("pair", "")
+        sl_counts[pair] = sl_counts.get(pair, 0) + 1
+
+    # Build blacklist
+    now_ts      = int(time.time())
+    cooldown_ts = now_ts + BLACKLIST_COOLDOWN_H * 3600
+    blacklist   = {}
+
+    for pair, count in sl_counts.items():
+        if count >= BLACKLIST_SL_COUNT:
+            blacklist[pair] = {
+                "sl_count":  count,
+                "until_ts":  cooldown_ts,
+            }
+            log(f"  🚫 BLACKLIST: {pair} — {count}× SL dalam {BLACKLIST_WINDOW_DAYS} hari")
+
+    if blacklist:
+        log(f"📊 Blacklist: {len(blacklist)} pair diblokir "
+            f"({BLACKLIST_COOLDOWN_H}j cooldown)")
+
+    state["blacklist"] = blacklist
+    return state
+
+
+def is_blacklisted(state: dict, pair: str) -> bool:
+    """Return True jika pair masih dalam cooldown blacklist."""
+    bl   = state.get("blacklist", {})
+    info = bl.get(pair)
+    if not info:
+        return False
+    # Cek apakah cooldown sudah berakhir
+    if int(time.time()) > info.get("until_ts", 0):
+        return False
+    return True
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -499,9 +741,130 @@ def format_watch(w: dict) -> str:
     )
 
 
-# ══════════════════════════════════════════════════════════════════
-#  RISK LEVELS
-# ══════════════════════════════════════════════════════════════════
+def check_early_signals(
+    active_watches: list[dict],
+    tickers:        dict,
+) -> list[dict]:
+    """
+    Cek pair dari WATCH list apakah sudah breakout EARLY_BREAKOUT_PCT%.
+    Jika ya → buat early signal dengan entry lebih awal dari pump biasa.
+
+    Keunggulan vs sinyal pump biasa:
+    - Entry lebih rendah (harga belum naik penuh)
+    - SL lebih ketat (EARLY_SL_PCT = 3% vs 5%)
+    - R/R lebih baik karena entry lebih baik
+    """
+    early_sigs = []
+    now_ts     = int(time.time())
+
+    for w in active_watches:
+        pair           = w["pair"]
+        baseline_price = float(w["baseline_price"])
+        td             = tickers.get(pair, {})
+        curr_price     = float(td.get("last", 0) or 0)
+
+        if curr_price <= 0 or baseline_price <= 0:
+            continue
+
+        pct_change = (curr_price - baseline_price) / baseline_price * 100
+
+        # Breakout: harga naik ≥ EARLY_BREAKOUT_PCT dari baseline WATCH
+        # Tapi belum terlalu besar (< PRICE_PUMP_PCT × 2) → masih early
+        if EARLY_BREAKOUT_PCT <= pct_change < PRICE_PUMP_PCT * 2:
+            age_min = (now_ts - w["ts"]) / 60
+            coin    = pair.replace("_idr", "").upper()
+            vol_idr = float(td.get("vol_idr", 0) or 0)
+            high_24h = float(td.get("high", 0) or 0)
+            low_24h  = float(td.get("low",  0) or 0)
+
+            early_sigs.append({
+                "pair":         pair,
+                "coin":         coin,
+                "price":        curr_price,
+                "baseline":     baseline_price,
+                "pct_from_watch": round(pct_change, 2),
+                "vol_idr":      vol_idr,
+                "vol_ratio":    w.get("vol_ratio", 0),
+                "high_24h":     high_24h,
+                "low_24h":      low_24h,
+                "watch_age_min": round(age_min, 0),
+                "ts":           datetime.now(WIB),
+            })
+            log(f"  ⚡→🚀 EARLY: {pair} +{pct_change:.1f}% dari WATCH baseline "
+                f"(watch {age_min:.0f} menit lalu)")
+
+    return early_sigs
+
+
+def format_early_signal(sig: dict) -> str:
+    """
+    Format early signal — entry sebelum pump penuh.
+    Level TP dihitung dinamis:
+      SL  = entry × (1 - EARLY_SL_PCT%)   ← lebih ketat dari sinyal biasa
+      R   = entry - SL
+      TP1 = high_24h jika antara entry+1R dan entry+2R, else entry+1R
+      TP2 = entry + 2R  (R/R standar 1:2)
+      TP3 = entry + 3R  atau high_24h × 1.03 jika lebih tinggi
+    """
+    pair_display = sig["pair"].replace("_", "/").upper()
+    entry   = sig["price"]
+    high_24h = sig.get("high_24h", 0)
+    sl      = entry * (1 - EARLY_SL_PCT / 100)
+    R       = entry - sl
+
+    # TP dinamis
+    tp2 = entry + 2 * R
+    tp3_base = entry + 3 * R
+    # TP3: ambil yang lebih tinggi antara 3R atau high_24h × 1.03
+    tp3 = max(tp3_base, high_24h * 1.03) if high_24h > tp2 else tp3_base
+    # TP1: high_24h jika berada di antara 1R dan 2R (natural resistance)
+    tp1_base = entry + 1 * R
+    if high_24h > 0 and tp1_base < high_24h < tp2:
+        tp1 = high_24h
+        tp1_label = f"<i>+{round((tp1-entry)/entry*100,1):.1f}% — high 24h</i>"
+    else:
+        tp1 = tp1_base
+        tp1_label = f"<i>+{round((tp1-entry)/entry*100,1):.1f}% (1R)</i>"
+
+    tp2_pct = round((tp2 - entry) / entry * 100, 1)
+    tp3_pct = round((tp3 - entry) / entry * 100, 1)
+
+    low_line = (
+        f"🛡 Support  : <code>{_fp(sig['low_24h'])}</code>  <i>(low 24h)</i>\n"
+        if sig.get("low_24h", 0) > 0 else ""
+    )
+    # Resistance note jika high_24h berada antara entry dan TP2
+    resistance = ""
+    if 0 < high_24h <= tp2:
+        resistance = (
+            f"⚠️ <i>Resistance di {_fp(high_24h)} (high 24h) — "
+            f"waspada sebelum TP2</i>\n"
+        )
+
+    ts = sig["ts"].strftime("%H:%M WIB")
+
+    return (
+        f"🚀 <b>EARLY SIGNAL — {sig['coin']}</b>\n"
+        f"<i>Konfirmasi WATCH {sig['watch_age_min']:.0f} mnt lalu</i>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"Pair       : <b>{pair_display}</b>\n"
+        f"Entry skrg : <b>{_fp(entry)}</b> IDR\n"
+        f"Dari WATCH : <b>+{sig['pct_from_watch']:.1f}%</b> "
+        f"<i>(baseline {_fp(sig['baseline'])})</i>\n"
+        f"\n"
+        f"🎯 TP1  : <b>{_fp(tp1)}</b>  {tp1_label}\n"
+        f"🏆 TP2  : <b>{_fp(tp2)}</b>  <i>+{tp2_pct:.1f}% (2R) — target utama</i>\n"
+        f"🚀 TP3  : <b>{_fp(tp3)}</b>  <i>+{tp3_pct:.1f}% (3R)</i>\n"
+        f"{low_line}"
+        f"🔴 SL   : <b>{_fp(sl)}</b>  <i>-{EARLY_SL_PCT:.0f}%</i>\n"
+        f"R/R     : <b>1:2.0</b>  |  R = {_fp(R)} IDR\n"
+        f"{resistance}"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"Vol 24h    : {_fmt_idr(sig['vol_idr'])}\n"
+        f"Vol Build  : {sig['vol_ratio']:.1f}× baseline\n"
+        f"⏰ {ts}\n"
+        f"⚡ <i>Early entry — SL ketat {EARLY_SL_PCT:.0f}% wajib!</i>"
+    )
 
 def calc_levels(current_price: float, high_24h: float = 0.0) -> dict:
     """
@@ -576,6 +939,7 @@ def analyze_pair(
     ticker_data: dict,
     history:     list[dict],
     gate_stats:  dict,
+    state:       dict | None = None,   # untuk blacklist check
 ) -> Optional[dict]:
     def _reject(reason: str) -> None:
         gate_stats[reason] = gate_stats.get(reason, 0) + 1
@@ -591,7 +955,11 @@ def analyze_pair(
         if not (VOL_IDR_MIN <= vol_idr <= VOL_IDR_MAX):
             _reject("PRE_vol_out_of_range"); return None
         if len(history) < MIN_SNAPS_SIGNAL:
-            _reject(f"STATE_need_more_snaps"); return None
+            _reject("STATE_need_more_snaps"); return None
+
+        # ── Feature 3: Blacklist check
+        if state and is_blacklisted(state, pair):
+            _reject("BLACKLISTED"); return None
 
         # Gate 1: Price Pump
         pump_ok, pump_pct = gate_price_pump(curr_price, history)
@@ -603,17 +971,20 @@ def analyze_pair(
         if not vol_ok:
             _reject("G2_vol_spike_fail"); return None
 
+        # ── Feature 2: Volume Confirmation (3 snapshot berturut naik)
+        vol_conf_ok, vol_conf_count = gate_vol_confirm(history, vol_idr)
+        if not vol_conf_ok:
+            _reject("G2b_vol_confirm_fail"); return None
+
         # Gate 3: Breakout
         break_ok, prev_max = gate_breakout(curr_price, history)
         if not break_ok:
             _reject("G3_breakout_fail"); return None
 
         # Gate 4: RSI Cross
-        # — bypass jika pump sangat besar (extreme momentum override)
         is_extreme = pump_pct >= EXTREME_PUMP_BYPASS_PCT
         rsi_ok, curr_rsi, has_rsi = gate_rsi_cross(curr_price, history)
         if is_extreme:
-            # Pump ekstrem tidak butuh konfirmasi oversold dulu
             curr_rsi = curr_rsi if has_rsi else 0.0
             has_rsi  = has_rsi
             # rsi_ok diabaikan — lolos langsung
@@ -1390,37 +1761,43 @@ def predict_wr(sig: dict, buckets: dict) -> tuple[float, str, bool]:
     return 0.0, "insufficient_data", False
 
 
-def adapt_thresholds(wr_data: dict) -> tuple[float, float]:
+def adapt_thresholds(
+    wr_data:   dict,
+    curr_pump: float | None = None,
+    curr_vol:  float | None = None,
+) -> tuple[float, float]:
     """
-    Sesuaikan PRICE_PUMP_PCT dan VOL_SPIKE_MULT berdasarkan winrate historis.
+    Sesuaikan threshold berdasarkan winrate historis.
+    Gunakan curr_pump/curr_vol dari state (persisten) sebagai base,
+    bukan dari env var yang reset tiap run.
 
-    Logic:
-      WR < 40%  → perketat threshold +15% (terlalu banyak false positive)
-      WR 40-55% → pertahankan threshold sekarang
-      WR > 65%  → longgarkan threshold -10% (bisa catch lebih banyak sinyal)
-
-    Bounds: PUMP [2.0, 8.0] | VOL [3.0, 12.0]
-    Return (new_pump_pct, new_vol_mult)
+    WR < 40%  → perketat +15%
+    WR 40-65% → pertahankan
+    WR > 65%  → longgarkan -10%
     """
+    base_pump = curr_pump if curr_pump is not None else PRICE_PUMP_PCT
+    base_vol  = curr_vol  if curr_vol  is not None else VOL_SPIKE_MULT
+
     if not wr_data or wr_data.get("n_total", 0) < WR_MIN_SAMPLE:
-        return PRICE_PUMP_PCT, VOL_SPIKE_MULT
+        return base_pump, base_vol
 
     wr = wr_data["wr"]
 
     if wr < 0.40:
-        factor = 1.15   # perketat
-        action = f"WR={wr:.0%} < 40% → PERKETAT threshold ×{factor}"
+        factor = 1.15
+        action = f"WR={wr:.0%} < 40% → PERKETAT ×{factor}"
     elif wr > 0.65:
-        factor = 0.90   # longgarkan
-        action = f"WR={wr:.0%} > 65% → LONGGARKAN threshold ×{factor}"
+        factor = 0.90
+        action = f"WR={wr:.0%} > 65% → LONGGARKAN ×{factor}"
     else:
-        log(f"📊 Adaptive: WR={wr:.0%} dalam range normal — threshold tidak berubah")
-        return PRICE_PUMP_PCT, VOL_SPIKE_MULT
+        log(f"📊 Adaptive: WR={wr:.0%} normal — threshold tidak berubah "
+            f"(pump={base_pump:.2f}% vol={base_vol:.2f}×)")
+        return base_pump, base_vol
 
-    new_pump = round(max(PUMP_PCT_MIN, min(PUMP_PCT_MAX, PRICE_PUMP_PCT * factor)), 2)
-    new_vol  = round(max(VOL_MULT_MIN, min(VOL_MULT_MAX, VOL_SPIKE_MULT * factor)), 2)
+    new_pump = round(max(PUMP_PCT_MIN, min(PUMP_PCT_MAX, base_pump * factor)), 2)
+    new_vol  = round(max(VOL_MULT_MIN, min(VOL_MULT_MAX, base_vol  * factor)), 2)
     log(f"📊 Adaptive: {action}")
-    log(f"   pump: {PRICE_PUMP_PCT}% → {new_pump}% | vol: {VOL_SPIKE_MULT}× → {new_vol}×")
+    log(f"   pump: {base_pump:.2f}% → {new_pump:.2f}% | vol: {base_vol:.2f}× → {new_vol:.2f}×")
     return new_pump, new_vol
 
 
@@ -1611,23 +1988,51 @@ def run_scan() -> None:
     if outcome_stats.get("evaluated", 0) > 0:
         log(f"📋 Outcome: {outcome_stats}")
 
-    # ── Step 1d: Load winrate, buckets & adaptive threshold
+    # ── Step 1d: Load winrate, buckets & adaptive threshold (persisten dari state)
     wr_data    = db_load_winrate()
     wr_buckets = db_load_wr_buckets()
-    PRICE_PUMP_PCT, VOL_SPIKE_MULT = adapt_thresholds(wr_data)
+
+    # Load threshold dari state (bukan dari env var yang reset tiap run)
+    curr_pump, curr_vol = state_load_thresholds(state)
+    log(f"📊 Threshold sebelum adapt: pump={curr_pump:.2f}% vol={curr_vol:.2f}×")
+    PRICE_PUMP_PCT, VOL_SPIKE_MULT = adapt_thresholds(wr_data, curr_pump, curr_vol)
+
+    # Simpan threshold hasil adapt ke state
+    state = state_save_thresholds(state, PRICE_PUMP_PCT, VOL_SPIKE_MULT)
+    log(f"📊 Threshold aktif: pump={PRICE_PUMP_PCT:.2f}% vol={VOL_SPIKE_MULT:.2f}×")
+
+    # ── Feature 1: BTC Trend Filter
+    btc_pct, btc_label = get_btc_trend(state)
+    if BTC_TREND_ENABLED and btc_label == "bearish":
+        msg = (
+            f"📉 <b>Market Bearish — Scan Ditahan</b>\n"
+            f"BTC turun <b>{btc_pct:.2f}%</b> dalam {BTC_TREND_WINDOW} snapshot terakhir\n"
+            f"Semua sinyal BUY ditahan untuk lindungi modal.\n"
+            f"<i>Bot tetap update state dan WATCH, tapi tidak kirim sinyal entry.</i>"
+        )
+        log(f"📉 BTC bearish {btc_pct:.2f}% → semua sinyal BUY ditahan", "warn")
+        tg(msg)
+        # Tetap update state + save, tapi skip scan sinyal
+        snapshot = build_snapshot(tickers)
+        state    = update_state(state, snapshot)
+        save_state(state)
+        return
+
+    # ── Feature 3: Update blacklist dari DB
+    state = db_update_blacklist(state)
 
     # Scan
     scanned    = 0
     candidates: list[dict] = []
-    watches:    list[dict] = []   # pre-pump watch signals
+    watches:    list[dict] = []
     gate_stats: dict[str, int] = {}
 
     for pair, ticker_data in tickers.items():
         scanned += 1
         history = get_pair_history(state, pair)
 
-        # ── Main pump signal (4 gate)
-        sig = analyze_pair(pair, ticker_data, history, gate_stats)
+        # ── Main pump signal (pass state untuk blacklist check)
+        sig = analyze_pair(pair, ticker_data, history, gate_stats, state)
         if sig:
             # Prediksi WR dari bucket historis
             pred_wr, bucket_key, has_bucket = predict_wr(sig, wr_buckets)
@@ -1721,11 +2126,16 @@ def run_scan() -> None:
         time.sleep(TG_SEND_SLEEP_SEC)
 
     if skipped > 0:
+        skipped_names = ", ".join(
+            s["coin"] for s in candidates[:MAX_SIGNALS_PER_RUN]
+            if s["pair"] in portfolio.get("open_pairs", set()) or not portfolio["can_add"]
+        )
         tg(
-            f"⛔ <b>{skipped} sinyal tidak dikirim</b> — portfolio limit tercapai\n"
-            f"Open: <b>{portfolio['open']}/{MAX_OPEN_TRADES}</b> trades  |  "
+            f"ℹ️ <b>{skipped} sinyal tidak dikirim</b>\n"
+            f"Pair: <code>{skipped_names}</code>\n"
+            f"Open: <b>{portfolio['open']}/{MAX_OPEN_TRADES}</b>  |  "
             f"Heat: <b>{portfolio['heat_pct']:.1f}%/{MAX_PORTFOLIO_HEAT:.0f}%</b>\n"
-            f"<i>Tunggu trade existing TP/SL dulu sebelum entry baru.</i>"
+            f"<i>Portfolio penuh atau pair sudah open.</i>"
         )
 
     # ── Open Trades Report (kirim setelah semua sinyal baru)
@@ -1735,7 +2145,53 @@ def run_scan() -> None:
         log("📋 Open trades report terkirim")
         time.sleep(TG_SEND_SLEEP_SEC)
 
-    # ── Kirim WATCH signals (pre-pump, max 3, sorted by vol_ratio)
+    # ── Cek WATCH list dari run sebelumnya → early signal
+    active_watches  = state_get_active_watches(state)
+    early_signals   = check_early_signals(active_watches, tickers) if active_watches else []
+    early_sent      = 0
+
+    if early_signals:
+        log(f"  🚀 {len(early_signals)} early signal ditemukan dari WATCH list")
+        for es in early_signals[:MAX_WATCH_PER_RUN]:
+            if pair in portfolio.get("open_pairs", set()):
+                log(f"  ⛔ {es['pair']} EARLY SKIP — sudah ada open trade", "warn")
+                continue
+            if not portfolio["can_add"]:
+                log(f"  ⛔ {es['pair']} EARLY SKIP — portfolio penuh", "warn")
+                break
+
+            # Build dummy sig dict untuk db_save_signal (pakai EARLY_SL_PCT)
+            entry_p   = es["price"]
+            sl_p      = entry_p * (1 - EARLY_SL_PCT / 100)
+            R         = entry_p - sl_p
+            lvl_early = {
+                "entry": entry_p, "sl": round(sl_p, 8),
+                "tp1":   round(entry_p + R,     8),
+                "tp2":   round(entry_p + 2 * R, 8),
+                "tp3":   round(entry_p + 3 * R, 8),
+            }
+            sig_early = {**es, "pump_pct": es["pct_from_watch"],
+                         "rsi": 0.0, "has_rsi": False, "is_extreme": False,
+                         "snaps": 0, "prev_max": es["baseline"],
+                         "pred_wr": 0.0, "has_bucket": False, "bucket_key": ""}
+
+            if tg(format_early_signal(es)):
+                early_sent += 1
+                db_save_signal(sig_early, lvl_early)
+                portfolio["open"]       += 1
+                portfolio["open_pairs"].add(es["pair"])
+                portfolio["heat_pct"]    = round(
+                    portfolio["open"] * (BASE_POSITION_IDR / DUMMY_DEPOSIT_IDR) * 100, 1
+                )
+                portfolio["can_add"]     = (
+                    portfolio["open"] < MAX_OPEN_TRADES and
+                    portfolio["heat_pct"] < MAX_PORTFOLIO_HEAT
+                )
+                state = state_remove_watch(state, es["pair"])
+                log(f"  🚀 EARLY {es['pair']} +{es['pct_from_watch']:.1f}% terkirim")
+            time.sleep(TG_SEND_SLEEP_SEC)
+
+    # ── Kirim WATCH signals baru + simpan ke state
     watches.sort(key=lambda x: -x["vol_ratio"])
     watch_sent = 0
     for w in watches[:MAX_WATCH_PER_RUN]:
@@ -1743,6 +2199,9 @@ def run_scan() -> None:
             watch_sent += 1
             log(f"  ⚡ WATCH terkirim: {w['pair']} vol×{w['vol_ratio']:.1f}")
         time.sleep(TG_SEND_SLEEP_SEC)
+
+    # Simpan WATCH baru ke state agar bisa dicek run berikutnya
+    state = state_save_watches(state, watches)
 
     if watch_sent > 0:
         log(f"  {watch_sent} watch signal terkirim")
@@ -1764,8 +2223,13 @@ def run_scan() -> None:
     elif wr_data and wr_data.get("n_total", 0) > 0:
         wr_line = f"\n📊 Akumulasi data: {wr_data['n_total']}/{WR_MIN_SAMPLE} sinyal closed"
 
-    tg(format_summary(scanned, len(state["snapshots"]), len(candidates), sent) + wr_line)
-    log(f"\n✅ Done — {sent}/{len(candidates)} sinyal | {watch_sent}/{len(watches)} watch")
+    btc_line = ""
+    if BTC_TREND_ENABLED:
+        btc_icon = "📈" if btc_label == "bullish" else ("📉" if btc_label == "bearish" else "➡️")
+        btc_line = f"\nBTC trend    : {btc_icon} <b>{btc_label}</b> ({btc_pct:+.2f}%)"
+
+    tg(format_summary(scanned, len(state["snapshots"]), len(candidates), sent) + wr_line + btc_line)
+    log(f"\n✅ Done — {sent} pump | {early_sent} early | {watch_sent} watch")
 
 
 # ══════════════════════════════════════════════════════════════════
