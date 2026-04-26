@@ -116,7 +116,6 @@ _BAYES_A, _BAYES_B = 0.5, 0.5
 BTC_TREND_ENABLED  = os.environ.get("BTC_TREND_ENABLED", "true").lower() == "true"
 BTC_TREND_WINDOW   = int(os.environ.get("BTC_TREND_WINDOW",  "3"))    # snapshot terakhir untuk trend
 BTC_DROP_THRESHOLD = float(os.environ.get("BTC_DROP_THRESHOLD", "-2.0"))  # % drop → skip semua sinyal
-BINANCE_BTC_URL    = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
 
 # ── Volume Confirmation (vol_delta naik N snapshot berturut)
 VOL_CONFIRM_SNAPS  = int(os.environ.get("VOL_CONFIRM_SNAPS", "3"))  # min snapshot delta naik
@@ -137,6 +136,9 @@ MAX_SIGNALS_PER_RUN = int(os.environ.get("MAX_SIGNALS_PER_RUN", "5"))
 
 # Indodax API
 INDODAX_TICKER_ALL = "https://indodax.com/api/ticker_all"
+INDODAX_SUMMARIES  = "https://indodax.com/api/summaries"
+INDODAX_TRADES     = "https://indodax.com/api/{pair}/trades"
+INDODAX_DEPTH      = "https://indodax.com/api/{pair}/depth"
 
 WIB = timezone(timedelta(hours=7))
 
@@ -284,30 +286,37 @@ def get_pair_history(state: dict, pair: str) -> list[dict]:
     return result
 
 
-def state_save_thresholds(state: dict, pump_pct: float, vol_mult: float) -> dict:
+def state_save_thresholds(state: dict, pump_pct: float, vol_mult: float,
+                          watch_vol_min: float | None = None,
+                          watch_flat_max: float | None = None) -> dict:
     """
-    Simpan threshold adaptif ke state agar persisten antar run.
-    Threshold tidak reset ke default setiap run.
+    Simpan threshold adaptif ke state — termasuk WATCH threshold.
     """
     state["adaptive"] = {
-        "pump_pct":  round(pump_pct, 3),
-        "vol_mult":  round(vol_mult, 3),
-        "updated_ts": int(time.time()),
+        "pump_pct":      round(pump_pct, 3),
+        "vol_mult":      round(vol_mult, 3),
+        "watch_vol_min": round(watch_vol_min, 3) if watch_vol_min else WATCH_VOL_BUILD_MIN,
+        "watch_flat_max": round(watch_flat_max, 3) if watch_flat_max else WATCH_PRICE_FLAT_PCT,
+        "updated_ts":    int(time.time()),
     }
     return state
 
 
-def state_load_thresholds(state: dict) -> tuple[float, float]:
+def state_load_thresholds(state: dict) -> tuple[float, float, float, float]:
     """
     Load threshold adaptif dari state.
-    Fallback ke env var default jika belum ada.
+    Return (pump_pct, vol_mult, watch_vol_min, watch_flat_max)
     """
-    adaptive = state.get("adaptive", {})
-    pump = float(adaptive.get("pump_pct", PRICE_PUMP_PCT))
-    vol  = float(adaptive.get("vol_mult", VOL_SPIKE_MULT))
-    pump = max(PUMP_PCT_MIN, min(PUMP_PCT_MAX, pump))
-    vol  = max(VOL_MULT_MIN,  min(VOL_MULT_MAX,  vol))
-    return pump, vol
+    adaptive      = state.get("adaptive", {})
+    pump          = float(adaptive.get("pump_pct",      PRICE_PUMP_PCT))
+    vol           = float(adaptive.get("vol_mult",      VOL_SPIKE_MULT))
+    watch_vol     = float(adaptive.get("watch_vol_min", WATCH_VOL_BUILD_MIN))
+    watch_flat    = float(adaptive.get("watch_flat_max",WATCH_PRICE_FLAT_PCT))
+    pump          = max(PUMP_PCT_MIN, min(PUMP_PCT_MAX, pump))
+    vol           = max(VOL_MULT_MIN, min(VOL_MULT_MAX,  vol))
+    watch_vol     = max(1.2, min(4.0, watch_vol))
+    watch_flat    = max(0.5, min(5.0, watch_flat))
+    return pump, vol, watch_vol, watch_flat
 
 
 def state_save_watches(state: dict, watches: list[dict]) -> dict:
@@ -354,44 +363,37 @@ def state_remove_watch(state: dict, pair: str) -> dict:
 #  FEATURE 1: MARKET CONDITION FILTER
 # ══════════════════════════════════════════════════════════════════
 
-def get_btc_trend(state: dict) -> tuple[float, str]:
+def get_btc_trend(state: dict, tickers: dict) -> tuple[float, str]:
     """
-    Cek trend BTC dari snapshot BTC yang tersimpan di state.
-    Jika belum ada, fetch dari Binance untuk seed awal.
+    Cek trend BTC menggunakan data btc_idr dari Indodax tickers.
+    Tidak butuh API Binance — pakai data yang sudah di-fetch.
 
-    Return (pct_change, label) dimana label:
-      "bearish"  — BTC turun ≥ BTC_DROP_THRESHOLD → block semua sinyal
-      "neutral"  — BTC flat atau naik tipis → lanjut
-      "bullish"  — BTC naik signifikan → boost confidence
+    BTC price history disimpan di state["btc_prices"] antar run.
+    Return (pct_change, label)
     """
-    # Ambil BTC history dari state
+    # Ambil harga BTC/IDR dari tickers yang sudah di-fetch
+    btc_td    = tickers.get("btc_idr", {})
+    btc_price = float(btc_td.get("last", 0) or 0)
+
+    if btc_price > 0:
+        state.setdefault("btc_prices", []).append({
+            "ts": int(time.time()), "price": btc_price
+        })
+        # Trim ke window yang diperlukan
+        state["btc_prices"] = state["btc_prices"][-(BTC_TREND_WINDOW * 3):]
+
     btc_history = state.get("btc_prices", [])
 
-    # Fetch harga BTC sekarang dari Binance
-    try:
-        resp  = requests.get(BINANCE_BTC_URL, timeout=REQUEST_TIMEOUT_SEC)
-        price = float(resp.json().get("price", 0))
-        if price > 0:
-            state.setdefault("btc_prices", []).append({
-                "ts": int(time.time()), "price": price
-            })
-            # Trim ke BTC_TREND_WINDOW × 2
-            state["btc_prices"] = state["btc_prices"][-(BTC_TREND_WINDOW * 2):]
-    except Exception as e:
-        log(f"BTC fetch dari Binance gagal: {e}", "warn")
-        price = 0.0
+    if len(btc_history) < 2 or btc_price <= 0:
+        return 0.0, "neutral"
 
-    btc_history = state.get("btc_prices", [])
-    if len(btc_history) < 2 or price <= 0:
-        return 0.0, "neutral"   # tidak cukup data → jangan blokir
-
-    # Bandingkan harga BTC sekarang vs N snapshot lalu
+    # Bandingkan vs BTC_TREND_WINDOW snapshot lalu
     window  = btc_history[-min(BTC_TREND_WINDOW + 1, len(btc_history)):]
     old_btc = float(window[0]["price"])
     if old_btc <= 0:
         return 0.0, "neutral"
 
-    pct = round((price - old_btc) / old_btc * 100, 2)
+    pct = round((btc_price - old_btc) / old_btc * 100, 2)
 
     if pct <= BTC_DROP_THRESHOLD:
         label = "bearish"
@@ -400,8 +402,9 @@ def get_btc_trend(state: dict) -> tuple[float, str]:
     else:
         label = "neutral"
 
-    log(f"📊 BTC trend: {pct:+.2f}% ({label}) | now={price:,.0f} | "
-        f"prev={old_btc:,.0f} ({len(window)-1} snap lalu)")
+    log(f"📊 BTC/IDR trend: {pct:+.2f}% ({label}) | "
+        f"now={btc_price:,.0f} | prev={old_btc:,.0f} "
+        f"({len(window)-1} snap lalu)")
     return pct, label
 
 
@@ -411,32 +414,37 @@ def get_btc_trend(state: dict) -> tuple[float, str]:
 
 def gate_vol_confirm(history: list[dict], curr_vol: float) -> tuple[bool, int]:
     """
-    Konfirmasi: volume delta harus naik berturut-turut selama
-    VOL_CONFIRM_SNAPS snapshot terakhir.
+    Konfirmasi volume: delta vol snapshot terakhir ≥ 2× rata-rata delta
+    3 snapshot sebelumnya.
 
-    Ini memastikan volume build-up berkelanjutan, bukan spike satu kali
-    yang langsung koreksi.
+    Ini lebih robust untuk rolling 24h vol Indodax yang naik-turun acak.
+    Tidak butuh ascending berturut-turut — cukup delta sekarang signifikan
+    dibanding baseline recent.
 
-    Return (passed, consecutive_count)
+    Return (passed, ratio_int)
     """
-    if len(history) < VOL_CONFIRM_SNAPS:
-        return False, 0
+    if len(history) < VOL_CONFIRM_SNAPS + 1:
+        return True, 0   # tidak cukup data → lolos (jangan blokir)
 
     vols   = [h["vol"] for h in history] + [curr_vol]
-    deltas = [max(0.0, vols[i] - vols[i-1]) for i in range(1, len(vols))]
+    deltas = [abs(vols[i] - vols[i-1]) for i in range(1, len(vols))]
 
-    if len(deltas) < VOL_CONFIRM_SNAPS:
-        return False, 0
+    if len(deltas) < VOL_CONFIRM_SNAPS + 1:
+        return True, 0
 
-    # Hitung berapa snapshot terakhir yang delta-nya naik berturut-turut
-    count = 0
-    for i in range(len(deltas) - 1, 0, -1):
-        if deltas[i] > deltas[i-1]:
-            count += 1
-        else:
-            break
+    curr_delta     = deltas[-1]
+    recent_deltas  = [d for d in deltas[-VOL_CONFIRM_SNAPS-1:-1] if d > 0]
 
-    return count >= VOL_CONFIRM_SNAPS, count
+    if not recent_deltas or curr_delta <= 0:
+        return True, 0   # tidak ada baseline → lolos
+
+    baseline = sum(recent_deltas) / len(recent_deltas)
+    if baseline <= 0:
+        return True, 0
+
+    ratio = curr_delta / baseline
+    # Lolos jika delta sekarang ≥ 1.5× baseline recent (volume akselerasi)
+    return ratio >= 1.5, int(ratio)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -613,6 +621,143 @@ def fetch_all_tickers() -> dict[str, dict]:
         return {}
 
 
+def fetch_summaries() -> dict[str, dict]:
+    """
+    Ambil /api/summaries — berisi price_24h, price_7d, volume per pair.
+    Berguna untuk filter pair yang sudah overbought vs yang masih fresh.
+    Return {pair: {last, high, low, vol, price_24h, price_7d}, ...}
+    """
+    try:
+        resp = requests.get(INDODAX_SUMMARIES, timeout=REQUEST_TIMEOUT_SEC)
+        resp.raise_for_status()
+        raw  = resp.json().get("tickers", {})
+        return {k: v for k, v in raw.items() if k.endswith("_idr")}
+    except Exception as e:
+        log(f"fetch_summaries() failed: {e}", "warn")
+        return {}
+
+
+def fetch_trades(pair: str) -> list[dict]:
+    """
+    Ambil 50 trade terakhir untuk satu pair.
+    Field: {date, price, amount, type (buy/sell), tid}
+    Digunakan untuk deteksi buy/sell pressure real-time.
+    """
+    try:
+        url  = INDODAX_TRADES.format(pair=pair)
+        resp = requests.get(url, timeout=REQUEST_TIMEOUT_SEC)
+        resp.raise_for_status()
+        body = resp.content.strip()
+        if not body:
+            return []
+        return resp.json() or []
+    except Exception:
+        return []
+
+
+def fetch_depth(pair: str) -> dict:
+    """
+    Ambil order book pair.
+    Field: {buy: [[price, amount], ...], sell: [[price, amount], ...]}
+    Digunakan untuk cek ketebalan ask wall (resistance) dan bid wall (support).
+    """
+    try:
+        url  = INDODAX_DEPTH.format(pair=pair)
+        resp = requests.get(url, timeout=REQUEST_TIMEOUT_SEC)
+        resp.raise_for_status()
+        body = resp.content.strip()
+        if not body:
+            return {}
+        return resp.json() or {}
+    except Exception:
+        return {}
+
+
+# ══════════════════════════════════════════════════════════════════
+#  ENRICHED DATA GATES
+# ══════════════════════════════════════════════════════════════════
+
+def gate_trade_pressure(pair: str) -> tuple[bool, float, str]:
+    """
+    Gate: Buy pressure dominan dari 50 trade terakhir.
+    Hitung buy_volume vs sell_volume → buyer ratio.
+
+    Lolos jika buyer ratio ≥ 60% (lebih banyak yang beli dari jual).
+
+    Return (passed, buyer_ratio, summary)
+    """
+    trades = fetch_trades(pair)
+    if not trades:
+        return True, 0.0, "no_data"   # tidak ada data → lolos (jangan blokir)
+
+    buy_vol  = sum(float(t.get("amount", 0)) for t in trades if t.get("type") == "buy")
+    sell_vol = sum(float(t.get("amount", 0)) for t in trades if t.get("type") == "sell")
+    total    = buy_vol + sell_vol
+
+    if total <= 0:
+        return True, 0.0, "no_volume"
+
+    ratio   = round(buy_vol / total * 100, 1)
+    passed  = ratio >= 60.0
+    summary = f"{ratio:.0f}% buy ({len(trades)} trades)"
+    return passed, ratio, summary
+
+
+def gate_ask_wall(pair: str, curr_price: float, tp1: float) -> tuple[bool, float]:
+    """
+    Gate: Cek apakah ada ask wall tebal antara harga sekarang dan TP1.
+    Jika ask wall > 5× rata-rata ask → sinyal mungkin kesulitan menembus.
+
+    Return (passed, wall_ratio)
+    passed=True jika tidak ada ask wall yang menghalangi (jalan ke TP1 bersih)
+    """
+    depth = fetch_depth(pair)
+    if not depth or "sell" not in depth:
+        return True, 0.0   # tidak ada data → lolos
+
+    asks = depth.get("sell", [])
+    if not asks:
+        return True, 0.0
+
+    # Filter ask antara harga sekarang dan TP1
+    blocking_asks = [
+        float(a[1]) for a in asks
+        if curr_price <= float(a[0]) <= tp1
+    ]
+    all_asks = [float(a[1]) for a in asks[:20]]  # top 20
+
+    if not blocking_asks or not all_asks:
+        return True, 0.0
+
+    avg_ask_size = sum(all_asks) / len(all_asks)
+    max_block    = max(blocking_asks)
+    wall_ratio   = round(max_block / avg_ask_size, 1)
+
+    # Lolos jika tidak ada ask yang > 5× rata-rata (tidak ada wall tebal)
+    return wall_ratio < 5.0, wall_ratio
+
+
+def gate_price_7d(pair: str, curr_price: float, summaries: dict) -> tuple[bool, float]:
+    """
+    Gate: Cek posisi harga sekarang relatif terhadap harga 7 hari lalu.
+    Jika sudah naik > 50% dalam 7 hari → sudah terlalu tinggi, skip.
+    Jika masih di bawah atau baru naik sedikit → masih ada upside.
+
+    Return (passed, pct_vs_7d)
+    """
+    summary = summaries.get(pair, {})
+    price_7d = float(summary.get("price_7d", 0) or 0)
+
+    if price_7d <= 0 or curr_price <= 0:
+        return True, 0.0   # tidak ada data → lolos
+
+    pct_vs_7d = round((curr_price - price_7d) / price_7d * 100, 1)
+
+    # Skip jika sudah pump > 50% dalam 7 hari (kemungkinan sudah di puncak)
+    passed = pct_vs_7d <= 50.0
+    return passed, pct_vs_7d
+
+
 # ══════════════════════════════════════════════════════════════════
 #  PRE-PUMP WATCH DETECTION
 # ══════════════════════════════════════════════════════════════════
@@ -716,28 +861,34 @@ def detect_pre_pump(
 
 
 def format_watch(w: dict) -> str:
-    """Format pesan WATCH signal — ringkas, bukan entry signal."""
-    ts           = w["ts"].strftime("%H:%M WIB")
+    """
+    WATCH — pre-pump detection.
+    Tampilkan trigger price yang jelas: jika tembus → Early Signal otomatis terkirim.
+    """
     pair_display = w["pair"].replace("_", "/").upper()
-    # Hitung jarak ke high_24h sebagai potensi target jika pump terjadi
-    upside = ""
-    if w["high_24h"] > w["price"] > 0:
-        pct_to_high = (w["high_24h"] - w["price"]) / w["price"] * 100
-        upside = f"  <i>(+{pct_to_high:.1f}% ke high 24h)</i>"
+    ts           = w["ts"].strftime("%H:%M WIB")
+    trigger      = w["price"] * (1 + EARLY_BREAKOUT_PCT / 100)
+    potential    = round((w["high_24h"] - w["price"]) / w["price"] * 100, 1) \
+                   if w.get("high_24h", 0) > w["price"] else 0
+    vr  = w["vol_ratio"]
+    bar = "█" * min(int(vr), 5) + "░" * max(0, 5 - int(vr))
 
     return (
-        f"⚡ <b>WATCH — {w['coin']}</b>\n"
+        f"⚡ <b>WATCH — {w['coin']}</b>  [{bar}]\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"Pair       : <b>{pair_display}</b>\n"
-        f"Harga      : <b>{_fp(w['price'])}</b> IDR{upside}\n"
-        f"Vol Build  : <b>{w['vol_ratio']:.1f}×</b> baseline "
-        f"<i>(accelerating 3 snap)</i>\n"
-        f"Price Flat : <b>{w['price_flat']:.1f}%</b> range 6 snap\n"
+        f"Harga skrg : <b>{_fp(w['price'])}</b> IDR\n"
+        f"🔔 Trigger  : <b>{_fp(trigger)}</b> IDR  "
+        f"<i>(+{EARLY_BREAKOUT_PCT:.1f}% → Early Signal)</i>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"Vol Build  : <b>{w['vol_ratio']:.1f}×</b>  <i>(accelerating)</i>\n"
+        f"Price Flat : <b>{w['price_flat']:.1f}%</b>  <i>(konsolidasi)</i>\n"
+        f"Potensi    : <b>+{potential:.1f}%</b> ke high 24h\n"
         f"Vol 24h    : {_fmt_idr(w['vol_idr'])}\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"🔔 <i>Pasang alert manual di Indodax jika harga tembus "
-        f"{_fp(w['price'] * 1.03)} (+3%)</i>\n"
-        f"⏰ {ts}  |  <i>Bukan sinyal entry — observasi saja</i>"
+        f"<i>⚡ Jika harga tembus trigger, Early Signal akan "
+        f"otomatis dikirim run berikutnya.</i>\n"
+        f"⏰ {ts}"
     )
 
 
@@ -939,7 +1090,8 @@ def analyze_pair(
     ticker_data: dict,
     history:     list[dict],
     gate_stats:  dict,
-    state:       dict | None = None,   # untuk blacklist check
+    state:       dict | None = None,
+    summaries:   dict | None = None,
 ) -> Optional[dict]:
     def _reject(reason: str) -> None:
         gate_stats[reason] = gate_stats.get(reason, 0) + 1
@@ -991,22 +1143,44 @@ def analyze_pair(
         elif has_rsi and not rsi_ok:
             _reject("G4_rsi_cross_fail"); return None
 
+        # ── Gate 5: Price vs 7d (filter pair sudah overbought)
+        pct_7d = 0.0
+        if summaries:
+            g5_ok, pct_7d = gate_price_7d(pair, curr_price, summaries)
+            if not g5_ok:
+                _reject(f"G5_overbought_7d"); return None
+
+        # ── Gate 6: Buy Pressure dari trade history
+        tp_ok, buyer_ratio, tp_summary = gate_trade_pressure(pair)
+        if not tp_ok:
+            _reject("G6_sell_pressure"); return None
+
+        # ── Gate 7: Ask Wall — jalan ke TP1 tidak diblokir order besar
+        entry_tmp = curr_price * (1 - ENTRY_DISCOUNT_PCT / 100)
+        R_tmp     = entry_tmp * (SL_PCT / 100)
+        tp1_tmp   = entry_tmp + R_tmp
+        wall_ok, wall_ratio = gate_ask_wall(pair, curr_price, tp1_tmp)
+        if not wall_ok:
+            _reject("G7_ask_wall"); return None
+
         coin = pair.replace("_idr", "").upper()
         return {
-            "pair":       pair,
-            "coin":       coin,
-            "price":      curr_price,
-            "vol_idr":    vol_idr,
-            "vol_ratio":  vol_ratio,
-            "pump_pct":   pump_pct,
-            "high_24h":   high_24h,
-            "low_24h":    low_24h,
-            "prev_max":   prev_max,
-            "rsi":        curr_rsi,
-            "has_rsi":    has_rsi,
-            "is_extreme": is_extreme,
-            "snaps":      len(history),
-            "ts":         datetime.now(WIB),
+            "pair":         pair,
+            "coin":         coin,
+            "price":        curr_price,
+            "vol_idr":      vol_idr,
+            "vol_ratio":    vol_ratio,
+            "pump_pct":     pump_pct,
+            "high_24h":     high_24h,
+            "low_24h":      low_24h,
+            "prev_max":     prev_max,
+            "rsi":          curr_rsi,
+            "has_rsi":      has_rsi,
+            "is_extreme":   is_extreme,
+            "buyer_ratio":  buyer_ratio,
+            "pct_7d":       pct_7d,
+            "snaps":        len(history),
+            "ts":           datetime.now(WIB),
         }
 
     except Exception as e:
@@ -1629,12 +1803,25 @@ def db_load_winrate() -> dict:
     pnl_vals   = [float(r["pnl_pct"]) for r in rows if r.get("pnl_pct") is not None]
     expectancy = round(sum(pnl_vals) / len(pnl_vals), 2) if pnl_vals else 0.0
 
+    # WR khusus Early Signal — pump_pct < PRICE_PUMP_PCT = entry pre-pump
+    early_rows   = [r for r in rows if float(r.get("pump_pct") or 99) < PRICE_PUMP_PCT]
+    n_early      = len(early_rows)
+    n_early_win  = sum(1 for r in early_rows if (r.get("result") or "").upper() in WIN_SET)
+    early_wr     = round(
+        (n_early_win + _BAYES_A) / (n_early + _BAYES_A + _BAYES_B), 3
+    ) if n_early > 0 else 0.5
+
+    if n_early > 0:
+        log(f"📊 Early Signal WR: {early_wr:.0%} ({n_early_win}/{n_early})")
+
     return {
         "wr":          round(wr_bayes, 3),
         "wr_freq":     round(wr_freq,  3),
         "n_total":     n_total,
         "n_win":       n_win,
         "expectancy":  expectancy,
+        "early_wr":    early_wr,
+        "n_early":     n_early,
     }
 
 
@@ -1762,43 +1949,75 @@ def predict_wr(sig: dict, buckets: dict) -> tuple[float, str, bool]:
 
 
 def adapt_thresholds(
-    wr_data:   dict,
-    curr_pump: float | None = None,
-    curr_vol:  float | None = None,
-) -> tuple[float, float]:
+    wr_data:        dict,
+    curr_pump:      float | None = None,
+    curr_vol:       float | None = None,
+    curr_watch_vol: float | None = None,
+    curr_watch_flat: float | None = None,
+) -> tuple[float, float, float, float]:
     """
-    Sesuaikan threshold berdasarkan winrate historis.
-    Gunakan curr_pump/curr_vol dari state (persisten) sebagai base,
-    bukan dari env var yang reset tiap run.
+    Sesuaikan semua threshold berdasarkan WR historis.
+    - pump/vol: dari WR global
+    - watch_vol/watch_flat: dari WR khusus Early Signal
 
-    WR < 40%  → perketat +15%
-    WR 40-65% → pertahankan
-    WR > 65%  → longgarkan -10%
+    Return (pump_pct, vol_mult, watch_vol_min, watch_flat_max)
     """
-    base_pump = curr_pump if curr_pump is not None else PRICE_PUMP_PCT
-    base_vol  = curr_vol  if curr_vol  is not None else VOL_SPIKE_MULT
+    base_pump       = curr_pump       if curr_pump       is not None else PRICE_PUMP_PCT
+    base_vol        = curr_vol        if curr_vol        is not None else VOL_SPIKE_MULT
+    base_watch_vol  = curr_watch_vol  if curr_watch_vol  is not None else WATCH_VOL_BUILD_MIN
+    base_watch_flat = curr_watch_flat if curr_watch_flat is not None else WATCH_PRICE_FLAT_PCT
 
     if not wr_data or wr_data.get("n_total", 0) < WR_MIN_SAMPLE:
-        return base_pump, base_vol
+        return base_pump, base_vol, base_watch_vol, base_watch_flat
 
     wr = wr_data["wr"]
 
+    # ── Adapt pump/vol dari WR global
     if wr < 0.40:
         factor = 1.15
-        action = f"WR={wr:.0%} < 40% → PERKETAT ×{factor}"
+        log(f"📊 Adaptive: WR={wr:.0%} < 40% → PERKETAT pump/vol ×{factor}")
     elif wr > 0.65:
         factor = 0.90
-        action = f"WR={wr:.0%} > 65% → LONGGARKAN ×{factor}"
+        log(f"📊 Adaptive: WR={wr:.0%} > 65% → LONGGARKAN pump/vol ×{factor}")
     else:
-        log(f"📊 Adaptive: WR={wr:.0%} normal — threshold tidak berubah "
-            f"(pump={base_pump:.2f}% vol={base_vol:.2f}×)")
-        return base_pump, base_vol
+        factor = 1.0
+        log(f"📊 Adaptive: WR={wr:.0%} normal — pump/vol tidak berubah")
 
     new_pump = round(max(PUMP_PCT_MIN, min(PUMP_PCT_MAX, base_pump * factor)), 2)
     new_vol  = round(max(VOL_MULT_MIN, min(VOL_MULT_MAX, base_vol  * factor)), 2)
-    log(f"📊 Adaptive: {action}")
-    log(f"   pump: {base_pump:.2f}% → {new_pump:.2f}% | vol: {base_vol:.2f}× → {new_vol:.2f}×")
-    return new_pump, new_vol
+
+    # ── Adapt WATCH threshold dari WR Early Signal
+    early_wr = wr_data.get("early_wr", 0.5)
+    n_early  = wr_data.get("n_early", 0)
+
+    if n_early >= 5:   # butuh minimal 5 early signal untuk adapt
+        if early_wr < 0.40:
+            # Early signal sering kalah → perketat WATCH (vol lebih tinggi, flat lebih ketat)
+            new_watch_vol  = round(min(4.0, base_watch_vol  * 1.15), 2)
+            new_watch_flat = round(max(0.5, base_watch_flat * 0.90), 2)
+            log(f"📊 WATCH adapt: early WR={early_wr:.0%} < 40% → "
+                f"vol_min {base_watch_vol:.2f}→{new_watch_vol:.2f} "
+                f"flat_max {base_watch_flat:.2f}→{new_watch_flat:.2f}")
+        elif early_wr > 0.65:
+            # Early signal bagus → longgarkan WATCH (catch lebih banyak)
+            new_watch_vol  = round(max(1.2, base_watch_vol  * 0.90), 2)
+            new_watch_flat = round(min(5.0, base_watch_flat * 1.10), 2)
+            log(f"📊 WATCH adapt: early WR={early_wr:.0%} > 65% → "
+                f"vol_min {base_watch_vol:.2f}→{new_watch_vol:.2f} "
+                f"flat_max {base_watch_flat:.2f}→{new_watch_flat:.2f}")
+        else:
+            new_watch_vol  = base_watch_vol
+            new_watch_flat = base_watch_flat
+            log(f"📊 WATCH adapt: early WR={early_wr:.0%} normal — tidak berubah")
+    else:
+        new_watch_vol  = base_watch_vol
+        new_watch_flat = base_watch_flat
+
+    if factor != 1.0:
+        log(f"   pump: {base_pump:.2f}% → {new_pump:.2f}% | "
+            f"vol: {base_vol:.2f}× → {new_vol:.2f}×")
+
+    return new_pump, new_vol, new_watch_vol, new_watch_flat
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1911,6 +2130,9 @@ def format_signal(sig: dict, wr_data: dict | None = None) -> str:
         f"━━━━━━━━━━━━━━━━━━\n"
         f"Pump       : <b>+{sig['pump_pct']:.2f}%</b> vs snapshot lalu\n"
         f"Vol Spike  : <b>{sig['vol_ratio']:.1f}×</b> baseline\n"
+        f"Buy Press  : <b>{sig.get('buyer_ratio', 0):.0f}%</b> "
+        f"<i>(dari 50 trade terakhir)</i>\n"
+        f"{('vs 7d     : <b>+' + str(sig['pct_7d']) + '%</b> ' + '<i>(masih ada upside)</i>' + chr(10)) if sig.get('pct_7d', 0) > 0 else ''}"
         f"{rsi_line}"
         f"Vol 24h    : {_fmt_idr(sig['vol_idr'])}\n"
         f"━━━━━━━━━━━━━━━━━━\n"
@@ -1975,13 +2197,17 @@ def run_scan() -> None:
     elif n_snaps < MIN_SNAPS_SIGNAL:
         log(f"⚠️  Masih akumulasi data: {n_snaps}/{MIN_SNAPS_SIGNAL} snapshot.", "warn")
 
-    # ── Step 1b: Fetch tickers dulu (dipakai scan + outcome check)
+    # ── Step 1b: Fetch tickers + summaries (dipakai scan + outcome check)
     log("Fetching ticker Indodax...")
     tickers = fetch_all_tickers()
     if not tickers:
         log("Gagal fetch tickers — abort.", "error")
         return
     log(f"Total pair IDR: {len(tickers)}")
+
+    log("Fetching summaries Indodax (price 7d)...")
+    summaries = fetch_summaries()
+    log(f"Summaries: {len(summaries)} pair")
 
     # ── Step 1c: Outcome tracking — pass tickers yg sudah di-fetch (no double call)
     outcome_stats = db_evaluate_outcomes(tickers)
@@ -1992,17 +2218,21 @@ def run_scan() -> None:
     wr_data    = db_load_winrate()
     wr_buckets = db_load_wr_buckets()
 
-    # Load threshold dari state (bukan dari env var yang reset tiap run)
-    curr_pump, curr_vol = state_load_thresholds(state)
-    log(f"📊 Threshold sebelum adapt: pump={curr_pump:.2f}% vol={curr_vol:.2f}×")
-    PRICE_PUMP_PCT, VOL_SPIKE_MULT = adapt_thresholds(wr_data, curr_pump, curr_vol)
+    # Load threshold dari state (persisten antar run)
+    curr_pump, curr_vol, curr_watch_vol, curr_watch_flat = state_load_thresholds(state)
+    log(f"📊 Threshold sebelum adapt: pump={curr_pump:.2f}% vol={curr_vol:.2f}× "
+        f"watch_vol={curr_watch_vol:.2f}× watch_flat={curr_watch_flat:.2f}%")
 
-    # Simpan threshold hasil adapt ke state
-    state = state_save_thresholds(state, PRICE_PUMP_PCT, VOL_SPIKE_MULT)
-    log(f"📊 Threshold aktif: pump={PRICE_PUMP_PCT:.2f}% vol={VOL_SPIKE_MULT:.2f}×")
+    PRICE_PUMP_PCT, VOL_SPIKE_MULT, WATCH_VOL_BUILD_MIN, WATCH_PRICE_FLAT_PCT = \
+        adapt_thresholds(wr_data, curr_pump, curr_vol, curr_watch_vol, curr_watch_flat)
 
-    # ── Feature 1: BTC Trend Filter
-    btc_pct, btc_label = get_btc_trend(state)
+    state = state_save_thresholds(state, PRICE_PUMP_PCT, VOL_SPIKE_MULT,
+                                   WATCH_VOL_BUILD_MIN, WATCH_PRICE_FLAT_PCT)
+    log(f"📊 Threshold aktif: pump={PRICE_PUMP_PCT:.2f}% vol={VOL_SPIKE_MULT:.2f}× "
+        f"watch_vol≥{WATCH_VOL_BUILD_MIN:.2f}× flat≤{WATCH_PRICE_FLAT_PCT:.2f}%")
+
+    # ── Feature 1: BTC Trend Filter (pakai BTC/IDR dari tickers Indodax)
+    btc_pct, btc_label = get_btc_trend(state, tickers)
     if BTC_TREND_ENABLED and btc_label == "bearish":
         msg = (
             f"📉 <b>Market Bearish — Scan Ditahan</b>\n"
@@ -2031,8 +2261,8 @@ def run_scan() -> None:
         scanned += 1
         history = get_pair_history(state, pair)
 
-        # ── Main pump signal (pass state untuk blacklist check)
-        sig = analyze_pair(pair, ticker_data, history, gate_stats, state)
+        # ── Main pump signal (pass state untuk blacklist + summaries untuk gate 5-7)
+        sig = analyze_pair(pair, ticker_data, history, gate_stats, state, summaries)
         if sig:
             # Prediksi WR dari bucket historis
             pred_wr, bucket_key, has_bucket = predict_wr(sig, wr_buckets)
@@ -2755,30 +2985,30 @@ class TestAdaptThresholds:
         return {"wr": wr, "n_total": n, "n_win": int(wr * n), "expectancy": 0.0}
 
     def test_low_wr_tightens(self):
-        p, v = adapt_thresholds(self._wr_data(0.35))
+        p, v, _, __ = adapt_thresholds(self._wr_data(0.35))
         assert p > PRICE_PUMP_PCT or v > VOL_SPIKE_MULT
 
     def test_high_wr_loosens(self):
-        p, v = adapt_thresholds(self._wr_data(0.70))
+        p, v, _, __ = adapt_thresholds(self._wr_data(0.70))
         assert p < PRICE_PUMP_PCT or v < VOL_SPIKE_MULT
 
     def test_normal_wr_unchanged(self):
         orig_p = PRICE_PUMP_PCT
         orig_v = VOL_SPIKE_MULT
-        p, v = adapt_thresholds(self._wr_data(0.52))
+        p, v, _, __ = adapt_thresholds(self._wr_data(0.52))
         assert p == orig_p
         assert v == orig_v
 
     def test_bounds_respected(self):
         """Threshold tidak boleh keluar dari batas min/max."""
-        p, v = adapt_thresholds(self._wr_data(0.05, n=100))  # WR sangat buruk
+        p, v, _, __ = adapt_thresholds(self._wr_data(0.05, n=100))  # WR sangat buruk
         assert p <= PUMP_PCT_MAX
         assert v <= VOL_MULT_MAX
 
     def test_insufficient_sample_unchanged(self):
         """Di bawah WR_MIN_SAMPLE → tidak ada perubahan."""
         orig_p = PRICE_PUMP_PCT
-        p, v = adapt_thresholds({"wr": 0.30, "n_total": 3})
+        p, v, _, __ = adapt_thresholds({"wr": 0.30, "n_total": 3})
         assert p == orig_p
 
 
