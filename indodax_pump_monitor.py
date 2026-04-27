@@ -325,17 +325,27 @@ def state_save_thresholds(state: dict, pump_pct: float, vol_mult: float,
 def state_load_thresholds(state: dict) -> tuple[float, float, float, float]:
     """
     Load threshold adaptif dari state.
-    Return (pump_pct, vol_mult, watch_vol_min, watch_flat_max)
+    Anti-spiral: jika saved threshold sudah > YAML baseline × 1.3 → reset ke baseline.
+    Ini mencegah threshold terus naik tanpa batas saat WR rendah.
     """
-    adaptive      = state.get("adaptive", {})
-    pump          = float(adaptive.get("pump_pct",      PRICE_PUMP_PCT))
-    vol           = float(adaptive.get("vol_mult",      VOL_SPIKE_MULT))
-    watch_vol     = float(adaptive.get("watch_vol_min", WATCH_VOL_BUILD_MIN))
-    watch_flat    = float(adaptive.get("watch_flat_max",WATCH_PRICE_FLAT_PCT))
-    pump          = max(PUMP_PCT_MIN, min(PUMP_PCT_MAX, pump))
-    vol           = max(VOL_MULT_MIN, min(VOL_MULT_MAX,  vol))
-    watch_vol     = max(1.2, min(4.0, watch_vol))
-    watch_flat    = max(0.5, min(5.0, watch_flat))
+    adaptive   = state.get("adaptive", {})
+    pump       = float(adaptive.get("pump_pct",      PRICE_PUMP_PCT))
+    vol        = float(adaptive.get("vol_mult",      VOL_SPIKE_MULT))
+    watch_vol  = float(adaptive.get("watch_vol_min", WATCH_VOL_BUILD_MIN))
+    watch_flat = float(adaptive.get("watch_flat_max",WATCH_PRICE_FLAT_PCT))
+
+    # Anti-spiral guard
+    if pump > PRICE_PUMP_PCT * 1.3:
+        log(f"📊 Anti-spiral reset: pump {pump:.2f}% → {PRICE_PUMP_PCT:.2f}%", "warn")
+        pump = PRICE_PUMP_PCT
+    if vol > VOL_SPIKE_MULT * 1.3:
+        log(f"📊 Anti-spiral reset: vol {vol:.2f}× → {VOL_SPIKE_MULT:.2f}×", "warn")
+        vol = VOL_SPIKE_MULT
+
+    pump       = max(PUMP_PCT_MIN, min(PUMP_PCT_MAX, pump))
+    vol        = max(VOL_MULT_MIN, min(VOL_MULT_MAX,  vol))
+    watch_vol  = max(1.2, min(4.0, watch_vol))
+    watch_flat = max(0.5, min(5.0, watch_flat))
     return pump, vol, watch_vol, watch_flat
 
 
@@ -2012,9 +2022,10 @@ def adapt_thresholds(
     curr_watch_flat: float | None = None,
 ) -> tuple[float, float, float, float]:
     """
-    Sesuaikan semua threshold berdasarkan WR historis.
-    - pump/vol: dari WR global
-    - watch_vol/watch_flat: dari WR khusus Early Signal
+    Sesuaikan threshold berdasarkan WR historis.
+
+    Anti-spiral: threshold tidak boleh naik di atas YAML baseline × 1.3.
+    Ini mencegah tightening spiral yang membuat sinyal menghilang selamanya.
 
     Return (pump_pct, vol_mult, watch_vol_min, watch_flat_max)
     """
@@ -2028,19 +2039,29 @@ def adapt_thresholds(
 
     wr = wr_data["wr"]
 
+    # ── Batas maksimal adaptive: tidak boleh lebih dari YAML baseline × 1.3
+    # Ini mencegah spiral tightening ketika WR rendah + sinyal langka
+    max_pump = round(PRICE_PUMP_PCT * 1.3, 2)
+    max_vol  = round(VOL_SPIKE_MULT  * 1.3, 2)
+
     # ── Adapt pump/vol dari WR global
     if wr < 0.40:
-        factor = 1.15
-        log(f"📊 Adaptive: WR={wr:.0%} < 40% → PERKETAT pump/vol ×{factor}")
+        factor = 1.10   # perketat lebih sedikit (+10% bukan +15%)
+        log(f"📊 Adaptive: WR={wr:.0%} < 40% → PERKETAT ×{factor} "
+            f"(cap: pump≤{max_pump}% vol≤{max_vol}×)")
     elif wr > 0.65:
         factor = 0.90
-        log(f"📊 Adaptive: WR={wr:.0%} > 65% → LONGGARKAN pump/vol ×{factor}")
+        log(f"📊 Adaptive: WR={wr:.0%} > 65% → LONGGARKAN ×{factor}")
     else:
         factor = 1.0
-        log(f"📊 Adaptive: WR={wr:.0%} normal — pump/vol tidak berubah")
+        log(f"📊 Adaptive: WR={wr:.0%} normal — tidak berubah")
 
-    new_pump = round(max(PUMP_PCT_MIN, min(PUMP_PCT_MAX, base_pump * factor)), 2)
-    new_vol  = round(max(VOL_MULT_MIN, min(VOL_MULT_MAX, base_vol  * factor)), 2)
+    new_pump = round(max(PUMP_PCT_MIN, min(max_pump, base_pump * factor)), 2)
+    new_vol  = round(max(VOL_MULT_MIN, min(max_vol,  base_vol  * factor)), 2)
+
+    if factor != 1.0:
+        log(f"   pump: {base_pump:.2f}% → {new_pump:.2f}% | "
+            f"vol: {base_vol:.2f}× → {new_vol:.2f}×")
 
     # ── Adapt WATCH threshold dari WR Early Signal
     early_wr = wr_data.get("early_wr", 0.5)
