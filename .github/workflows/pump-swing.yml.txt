@@ -1,10 +1,9 @@
-name: Pump Monitor — Momentum (5m)
-# Mode: WATCH hunter agresif + Sniper path
-# Target: deteksi pre-pump dan early entry
+name: Pump Monitor — Swing (1h)
+# Mode: konfirmasi lebih selektif, sinyal berkualitas tinggi
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "0 * * * *"
   workflow_dispatch:
 
 jobs:
@@ -27,9 +26,9 @@ jobs:
         run: pytest indodax_pump_monitor.py --tb=short -q
 
   scan:
-    name: Scan Momentum Signals
+    name: Scan Swing Signals
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 10
     needs: test
     permissions:
       contents: write
@@ -43,45 +42,45 @@ jobs:
           cache: "pip"
       - name: Install dependencies
         run: pip install -r requirements.txt
-      - name: Run pump monitor (momentum — WATCH hunter + Sniper)
+      - name: Run pump monitor (swing — selektif)
         env:
           TELEGRAM_BOT_TOKEN:    ${{ secrets.TG_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:      ${{ secrets.TG_CHAT_ID }}
           SUPABASE_URL:          ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY:          ${{ secrets.SUPABASE_KEY }}
-          STATE_FILE:            price_state_momentum.json
+          STATE_FILE:            price_state_swing.json
 
-          # ── Signal thresholds (v3 — agresif)
-          PRICE_PUMP_PCT:        "1.5"
-          VOL_SPIKE_MULT:        "2.0"
+          # ── Signal thresholds (swing lebih ketat dari momentum)
+          PRICE_PUMP_PCT:        "2.0"
+          VOL_SPIKE_MULT:        "3.0"
           BREAKOUT_PCT:          "1.0"
-          SNIPER_PUMP_PCT:       "0.8"
-          SNIPER_VOL_MULT:       "1.5"
+          SNIPER_PUMP_PCT:       "1.0"
+          SNIPER_VOL_MULT:       "2.0"
 
           # ── Entry & risk
           ENTRY_DISCOUNT_PCT:    "0.5"
           SL_PCT:                "5.0"
 
-          # ── WATCH detection (agresif)
-          WATCH_PRICE_FLAT_PCT:  "3.0"
-          WATCH_VOL_BUILD_MIN:   "1.5"
-          WATCH_VOL_BUILD_MAX:   "4.9"
-          WATCH_MIN_SNAPS:       "3"
-          MAX_WATCH_PER_RUN:     "5"
+          # ── WATCH detection (lebih selektif)
+          WATCH_PRICE_FLAT_PCT:  "2.0"
+          WATCH_VOL_BUILD_MIN:   "2.0"
+          WATCH_VOL_BUILD_MAX:   "5.0"
+          WATCH_MIN_SNAPS:       "5"
+          MAX_WATCH_PER_RUN:     "3"
 
           # ── Early signal
-          EARLY_BREAKOUT_PCT:    "1.0"
-          WATCH_EXPIRE_MINUTES:  "20"
-          EARLY_SL_PCT:          "2.5"
+          EARLY_BREAKOUT_PCT:    "1.5"
+          WATCH_EXPIRE_MINUTES:  "45"
+          EARLY_SL_PCT:          "3.0"
 
-          # ── Market filter
-          BTC_DROP_THRESHOLD:    "-3.0"
+          # ── Market filter (swing lebih ketat)
+          BTC_DROP_THRESHOLD:    "-2.0"
           EXTREME_PUMP_BYPASS_PCT: "10.0"
 
           # ── Portfolio
-          MAX_SIGNALS_PER_RUN:   "5"
-          MAX_OPEN_TRADES:       "15"
-          MAX_PORTFOLIO_HEAT:    "30"
+          MAX_SIGNALS_PER_RUN:   "2"
+          MAX_OPEN_TRADES:       "8"
+          MAX_PORTFOLIO_HEAT:    "20"
         run: python indodax_pump_monitor.py
 
       - name: Commit & push state file
@@ -89,6 +88,6 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add price_state_momentum.json
-          git diff --cached --quiet || git commit -m "chore: update state [momentum] [skip ci]"
+          git add price_state_swing.json
+          git diff --cached --quiet || git commit -m "chore: update state [swing] [skip ci]"
           git push
