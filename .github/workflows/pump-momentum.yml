@@ -51,7 +51,11 @@ jobs:
           SUPABASE_KEY:          ${{ secrets.SUPABASE_KEY }}
           STATE_FILE:            price_state_momentum.json
 
-          # ── Signal thresholds (v3 — agresif)
+          # ── Tier & score filter  ← FIX: sebelumnya tidak ada, default terlalu longgar
+          SCORE_THRESHOLD:       "5"    # naik dari default 3 → kurangi noise
+          TIER_MIN_SEND:         "B"    # tetap B dulu, naikkan ke A setelah WR ≥ 40%
+
+          # ── Signal thresholds (momentum agresif)
           PRICE_PUMP_PCT:        "1.5"
           VOL_SPIKE_MULT:        "2.0"
           BREAKOUT_PCT:          "1.0"
@@ -82,6 +86,9 @@ jobs:
           MAX_SIGNALS_PER_RUN:   "5"
           MAX_OPEN_TRADES:       "15"
           MAX_PORTFOLIO_HEAT:    "30"
+
+          # ── Rate-limit guard (v5.5)
+          TRADE_PRESSURE_SLEEP_SEC: "0.05"
         run: python indodax_pump_monitor.py
 
       - name: Commit & push state file

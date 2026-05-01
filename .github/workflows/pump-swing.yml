@@ -50,6 +50,10 @@ jobs:
           SUPABASE_KEY:          ${{ secrets.SUPABASE_KEY }}
           STATE_FILE:            price_state_swing.json
 
+          # ── Tier & score filter  ← FIX: sebelumnya tidak ada, default terlalu longgar
+          SCORE_THRESHOLD:       "7"    # swing lebih ketat dari momentum
+          TIER_MIN_SEND:         "B"    # tetap B dulu, naikkan ke A setelah WR ≥ 40%
+
           # ── Signal thresholds (swing lebih ketat dari momentum)
           PRICE_PUMP_PCT:        "2.0"
           VOL_SPIKE_MULT:        "3.0"
@@ -81,6 +85,9 @@ jobs:
           MAX_SIGNALS_PER_RUN:   "2"
           MAX_OPEN_TRADES:       "8"
           MAX_PORTFOLIO_HEAT:    "20"
+
+          # ── Rate-limit guard (v5.5)
+          TRADE_PRESSURE_SLEEP_SEC: "0.05"
         run: python indodax_pump_monitor.py
 
       - name: Commit & push state file
